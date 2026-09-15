@@ -1,0 +1,20 @@
+# Standalone example plugin for casual. Build it, drop the resulting shared
+# library into your plugin dir, and `casual plugin list` will pick it up.
+#
+#   cd example-plugin && cargo build --release
+#   mkdir -p ~/.config/casual/plugins
+#   cp target/release/libcasual_plugin_hello.dylib ~/.config/casual/plugins/
+#   casual plugin run hello world
+#
+# (.so on Linux, .dll on Windows.)
+
+[package]
+name = "casual-plugin-hello"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+# Its own workspace root so it doesn't get pulled into the parent crate.
+[workspace]

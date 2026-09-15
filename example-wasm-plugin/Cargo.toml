@@ -1,0 +1,25 @@
+# Example sandboxed WASM plugin for casual.
+#
+#   rustup target add wasm32-unknown-unknown        # once
+#   cd example-wasm-plugin && cargo build --release --target wasm32-unknown-unknown
+#   mkdir -p ~/.config/casual/plugins
+#   cp target/wasm32-unknown-unknown/release/casual_wasm_hello.wasm ~/.config/casual/plugins/
+#   casual plugin run casual_wasm_hello          # needs a `--features wasm` casual
+#
+# The plugin can ONLY compute and call the host `print` function — it has no
+# access to the filesystem or network. That's the sandbox.
+
+[package]
+name = "casual-wasm-hello"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "casual_wasm_hello"
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

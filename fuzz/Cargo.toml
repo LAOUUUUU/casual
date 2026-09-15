@@ -1,0 +1,41 @@
+# Fuzz targets for casual's hand-rolled parsers.
+#
+#   cargo install cargo-fuzz          # once (needs a nightly toolchain)
+#   cargo +nightly fuzz run dns_parse
+#   cargo +nightly fuzz run http_parse
+#
+# These feed arbitrary bytes to the DNS and HTTP parsers and fail on any panic.
+# (The DNS out-of-bounds bug fixed in v0.4 was first caught by the equivalent
+# in-tree test `dns::tests::parser_never_panics_on_garbage`.)
+
+[package]
+name = "casual-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.casual]
+path = ".."
+
+[[bin]]
+name = "dns_parse"
+path = "fuzz_targets/dns_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_parse"
+path = "fuzz_targets/http_parse.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone so it isn't pulled into the parent crate's normal build.
+[workspace]
