@@ -1,5 +1,7 @@
 # casual
 
+[![CI](https://github.com/LAOUUUUU/casual/actions/workflows/ci.yml/badge.svg)](https://github.com/LAOUUUUU/casual/actions/workflows/ci.yml)
+
 A small, modular, plugin-driven CLI toolkit in Rust. One tiny default binary,
 no async runtime, no GUI framework — built to be cheap to run and easy to
 extend. Heavier capabilities (HTTPS interception, a TLS client, a TUI, a WASM
