@@ -231,7 +231,9 @@ fn cstr(p: *const c_char) -> Result<String> {
 mod wasm {
     use super::{Plugin, plugin_dir};
     use anyhow::{Context, Result, anyhow};
-    use wasmtime::{Caller, Engine, Extern, Linker, Module, Store};
+    use wasmtime::{
+        Caller, Engine, Extern, Linker, Module, Store, StoreLimits, StoreLimitsBuilder,
+    };
 
     /// Validate a guest (ptr, len) against the guest memory length, rejecting
     /// negative or overflowing values. Returns the byte range to read.
@@ -298,16 +300,16 @@ mod wasm {
             "sandboxed WASM plugin"
         }
         fn usage(&self) -> &str {
-            "<name>   (runs in a wasm sandbox; no fs/network access)"
+            "<name>   (wasm sandbox: no fs/network; args are not passed to the guest)"
         }
         fn run(&self, _args: &[String]) -> Result<()> {
-            let mut linker: Linker<()> = Linker::new(&self.engine);
+            let mut linker: Linker<StoreLimits> = Linker::new(&self.engine);
             // The single host capability we grant: print bytes from guest memory.
             linker
                 .func_wrap(
                     "casual",
                     "print",
-                    |mut caller: Caller<'_, ()>, ptr: i32, len: i32| {
+                    |mut caller: Caller<'_, StoreLimits>, ptr: i32, len: i32| {
                         let Some(Extern::Memory(mem)) = caller.get_export("memory") else {
                             return;
                         };
@@ -321,9 +323,16 @@ mod wasm {
                 )
                 .context("linking host function")?;
 
-            let mut store = Store::new(&self.engine, ());
-            // Bound total execution; a normal plugin uses a tiny fraction.
-            store.set_fuel(1_000_000_000).context("setting wasm fuel")?;
+            // Cap linear memory so a plugin can't balloon the host, and bound
+            // total execution with fuel (a normal plugin uses a tiny fraction).
+            let limits = StoreLimitsBuilder::new()
+                .memory_size(64 * 1024 * 1024)
+                .build();
+            let mut store = Store::new(&self.engine, limits);
+            store.limiter(|lim| lim);
+            store
+                .set_fuel(crate::config::load().wasm_fuel())
+                .context("setting wasm fuel")?;
             let instance = linker
                 .instantiate(&mut store, &self.module)
                 .context("instantiating wasm module")?;

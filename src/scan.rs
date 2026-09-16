@@ -22,13 +22,9 @@ use std::path::{Path, PathBuf};
 use tracing::debug;
 use walkdir::WalkDir;
 
-/// How many bytes of a file we keep in memory for pattern matching. The hash
-/// and entropy are always streamed, so only pattern search is capped.
-///
-/// LIMITATION: patterns are only matched within the first `MAX_PATTERN_BYTES`.
-/// A file larger than this is skipped for pattern matching entirely, so a
-/// byte-pattern signature can be evaded by prepending/appending padding. Hash
-/// signatures still fire on the whole file. A real engine slides the window.
+/// How many bytes of a file we keep buffered in memory. Hashing, entropy, and
+/// pattern matching are all streamed; this only bounds the copy kept for zip
+/// archive inspection (a file larger than this isn't opened as an archive).
 const MAX_PATTERN_BYTES: usize = 5 * 1024 * 1024;
 
 #[derive(Args)]
@@ -305,6 +301,18 @@ fn scan_file(
     let mut buffered: Vec<u8> = Vec::new();
     let mut overflowed = false;
 
+    // Streaming pattern match with a carry-over of the last (max_pat - 1) bytes,
+    // so signatures are checked across the WHOLE file and spanning chunk
+    // boundaries — padding the file can't push a pattern out of a fixed window.
+    let max_pat = db
+        .patterns
+        .iter()
+        .map(|p| p.contains.len())
+        .max()
+        .unwrap_or(0);
+    let mut pat_hit = vec![false; db.patterns.len()];
+    let mut carry: Vec<u8> = Vec::new();
+
     let mut chunk = [0u8; 64 * 1024];
     loop {
         let n = file.read(&mut chunk)?;
@@ -317,12 +325,27 @@ fn scan_file(
             freq[b as usize] += 1;
         }
         size += n as u64;
+
+        if max_pat > 0 {
+            let mut window = std::mem::take(&mut carry);
+            window.extend_from_slice(bytes);
+            let text = String::from_utf8_lossy(&window);
+            for (i, sig) in db.patterns.iter().enumerate() {
+                if !pat_hit[i] && text.contains(&sig.contains) {
+                    pat_hit[i] = true;
+                }
+            }
+            let keep = max_pat.saturating_sub(1).min(window.len());
+            carry = window[window.len() - keep..].to_vec();
+        }
+
+        // Keep a bounded prefix in memory only for archive inspection.
         if !overflowed {
             if buffered.len() + n <= MAX_PATTERN_BYTES {
                 buffered.extend_from_slice(bytes);
             } else {
                 overflowed = true;
-                buffered.clear(); // too big to pattern-match; free the memory
+                buffered.clear();
             }
         }
     }
@@ -338,13 +361,10 @@ fn scan_file(
         reasons.push(format!("known signature: {label}"));
     }
 
-    if !overflowed {
-        let text = String::from_utf8_lossy(&buffered);
-        for sig in &db.patterns {
-            if text.contains(&sig.contains) {
-                verdict = worse(verdict, Verdict::Malicious);
-                reasons.push(format!("pattern match: {}", sig.label));
-            }
+    for (i, sig) in db.patterns.iter().enumerate() {
+        if pat_hit[i] {
+            verdict = worse(verdict, Verdict::Malicious);
+            reasons.push(format!("pattern match: {}", sig.label));
         }
     }
 

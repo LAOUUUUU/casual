@@ -16,6 +16,7 @@ pub struct Config {
     pub entropy_threshold: Option<f64>,
     pub plugin_dir: Option<String>,
     pub dns_server: Option<String>,
+    pub wasm_fuel: Option<u64>,
 }
 
 impl Config {
@@ -34,6 +35,10 @@ impl Config {
         self.dns_server
             .clone()
             .unwrap_or_else(|| "1.1.1.1".to_string())
+    }
+    /// Fuel budget for a WASM plugin run (bounds a runaway plugin).
+    pub fn wasm_fuel(&self) -> u64 {
+        self.wasm_fuel.unwrap_or(100_000_000)
     }
 }
 
@@ -63,6 +68,7 @@ proxy_port = 8080
 max_conns = 256
 entropy_threshold = 7.2
 dns_server = \"1.1.1.1\"
+wasm_fuel = 100000000
 # plugin_dir = \"/absolute/path/to/plugins\"
 ";
 
@@ -85,6 +91,7 @@ pub fn show() -> Result<()> {
     println!("  max_conns          {}", cfg.max_conns());
     println!("  entropy_threshold  {}", cfg.entropy_threshold());
     println!("  dns_server         {}", cfg.dns_server());
+    println!("  wasm_fuel          {}", cfg.wasm_fuel());
     println!(
         "  plugin_dir         {}",
         cfg.plugin_dir.clone().unwrap_or_else(|| "(auto)".into())

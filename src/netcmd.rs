@@ -741,6 +741,9 @@ fn parse_url(url: &str) -> Result<(String, String, u16, String)> {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
+    // Drop any #fragment — it's client-side only and must not go on the wire.
+    let path = path.split('#').next().unwrap_or("/");
+    let path = if path.is_empty() { "/" } else { path };
     let (host, port) = split_target(authority, default_port);
     Ok((scheme.to_string(), host, port, path.to_string()))
 }

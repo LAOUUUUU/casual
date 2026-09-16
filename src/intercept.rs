@@ -28,6 +28,7 @@ use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use tracing::{debug, info, warn};
 
@@ -39,6 +40,12 @@ struct Ca {
     key: KeyPair,
 }
 
+/// Host allow/block policy (same semantics as the plain proxy).
+struct Policy {
+    block: Vec<String>,
+    allow: Vec<String>,
+}
+
 pub fn run(args: ProxyArgs) -> Result<()> {
     install_crypto_provider();
     let ca = Arc::new(load_ca().context(
@@ -46,31 +53,43 @@ pub fn run(args: ProxyArgs) -> Result<()> {
     )?);
     let client_config = Arc::new(build_client_config());
     // Same allow/block policy as the plain proxy.
-    let policy = Arc::new((args.block.clone(), args.allow_only.clone()));
+    let policy = Arc::new(Policy {
+        block: args.block.clone(),
+        allow: args.allow_only.clone(),
+    });
 
-    let port = args
-        .port
-        .unwrap_or_else(|| crate::config::load().proxy_port());
+    let cfg = crate::config::load();
+    let port = args.port.unwrap_or_else(|| cfg.proxy_port());
+    let max_conns = args.max_conns.unwrap_or_else(|| cfg.max_conns());
     let addr = format!("{}:{}", args.bind, port);
     let listener = TcpListener::bind(&addr).with_context(|| format!("binding {addr}"))?;
     info!("casual proxy (INTERCEPT) listening on http://{addr}");
     info!("HTTPS is DECRYPTED using your local CA. Devices you control only.");
 
+    let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
-        let client = match stream {
+        let mut client = match stream {
             Ok(c) => c,
             Err(e) => {
                 warn!("accept failed: {e}");
                 continue;
             }
         };
+        if active.load(Ordering::SeqCst) >= max_conns {
+            warn!("at connection cap ({max_conns}), refusing");
+            let _ = client.write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
+            continue;
+        }
+        active.fetch_add(1, Ordering::SeqCst);
         let ca = Arc::clone(&ca);
         let cc = Arc::clone(&client_config);
         let policy = Arc::clone(&policy);
+        let active_cl = Arc::clone(&active);
         thread::spawn(move || {
             if let Err(e) = handle(client, &ca, &cc, &policy) {
                 debug!("connection ended: {e}");
             }
+            active_cl.fetch_sub(1, Ordering::SeqCst);
         });
     }
     Ok(())
@@ -80,7 +99,7 @@ fn handle(
     mut client: TcpStream,
     ca: &Ca,
     client_config: &Arc<ClientConfig>,
-    policy: &(Vec<String>, Vec<String>),
+    policy: &Policy,
 ) -> Result<()> {
     let head = read_head(&mut client)?;
     if head.is_empty() {
@@ -94,7 +113,7 @@ fn handle(
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = split_host_port(&target, 443);
-        if !crate::proxy::host_allowed(&host, &policy.0, &policy.1) {
+        if !crate::proxy::host_allowed(&host, &policy.block, &policy.allow) {
             warn!(%host, "blocked by policy");
             let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
             return Ok(());
@@ -105,7 +124,7 @@ fn handle(
         }
     } else if !method.is_empty() {
         let (host, ..) = parse_http_target(&target);
-        if !crate::proxy::host_allowed(&host, &policy.0, &policy.1) {
+        if !crate::proxy::host_allowed(&host, &policy.block, &policy.allow) {
             warn!(%host, "blocked by policy");
             let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
             return Ok(());
@@ -182,9 +201,8 @@ fn forward_plain(mut client: TcpStream, head_str: &str, method: &str, target: &s
     let v = fp.next().unwrap_or("HTTP/1.1");
     let mut rebuilt = format!("{m} {path} {v}\r\n");
     for line in lines {
-        // Hop-by-hop proxy headers must not be forwarded to the origin.
-        let lower = line.to_ascii_lowercase();
-        if lower.starts_with("proxy-connection:") || lower.starts_with("proxy-authorization:") {
+        // Hop-by-hop headers must not be forwarded to the origin.
+        if is_hop_by_hop(&line.to_ascii_lowercase()) {
             continue;
         }
         rebuilt.push_str(line);
@@ -221,19 +239,13 @@ fn ca_paths() -> Result<(PathBuf, PathBuf)> {
 
 fn load_ca() -> Result<Ca> {
     let (cert_path, key_path) = ca_paths()?;
-    // Refuse to use a CA key that others can read — it can mint trusted certs.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(&key_path)
-            && meta.permissions().mode() & 0o077 != 0
-        {
-            anyhow::bail!(
-                "CA key {} is readable by group/other. Run `casual ca` to fix its \
-                 permissions (or `chmod 600` it) before intercepting.",
-                key_path.display()
-            );
-        }
+    // A CA key others can read can mint trusted certs — auto-tighten it (it's
+    // on the user's own machine) and warn, rather than making them re-run `ca`.
+    if let Some(old) = harden_key_perms(&key_path)? {
+        warn!(
+            "tightened CA key {} to 0600 (was {old:o})",
+            key_path.display()
+        );
     }
     let cert_pem = std::fs::read_to_string(&cert_path)
         .with_context(|| format!("reading {}", cert_path.display()))?;
@@ -299,6 +311,7 @@ fn write_private_key(path: &Path, pem: &str) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::PermissionsExt;
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -307,6 +320,9 @@ fn write_private_key(path: &Path, pem: &str) -> Result<()> {
             .open(path)
             .with_context(|| format!("creating {}", path.display()))?;
         f.write_all(pem.as_bytes())?;
+        // `.mode()` only applies when the file is newly created; enforce 0600
+        // unconditionally so overwriting a pre-existing loose key still hardens.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         Ok(())
     }
     #[cfg(not(unix))]
@@ -362,7 +378,7 @@ fn build_client_config() -> ClientConfig {
 
 // --- small HTTP helpers -----------------------------------------------------
 
-fn read_head<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
+fn read_head<R: Read>(r: &mut R) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(1024);
     let mut b = [0u8; 1];
     loop {
@@ -371,8 +387,13 @@ fn read_head<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
             break;
         }
         buf.push(b[0]);
-        if buf.ends_with(b"\r\n\r\n") || buf.len() >= MAX_HEAD {
+        if buf.ends_with(b"\r\n\r\n") {
             break;
+        }
+        // Don't silently truncate an over-long head and forward a partial
+        // request — same smuggling risk as the plain proxy.
+        if buf.len() >= MAX_HEAD {
+            anyhow::bail!("request head exceeded {MAX_HEAD} bytes");
         }
     }
     Ok(buf)
@@ -403,6 +424,22 @@ fn parse_content_length(head: &str) -> usize {
     0
 }
 
+/// RFC 7230 hop-by-hop headers, which a proxy must not forward to the origin.
+fn is_hop_by_hop(line_lower: &str) -> bool {
+    const H: &[&str] = &[
+        "connection:",
+        "proxy-connection:",
+        "keep-alive:",
+        "proxy-authenticate:",
+        "proxy-authorization:",
+        "te:",
+        "trailer:",
+        "transfer-encoding:",
+        "upgrade:",
+    ];
+    H.iter().any(|h| line_lower.starts_with(h))
+}
+
 fn force_connection_close(head: &str) -> String {
     let mut out = String::new();
     for (i, line) in head.split("\r\n").enumerate() {
@@ -414,8 +451,8 @@ fn force_connection_close(head: &str) -> String {
             out.push_str("\r\n");
             continue;
         }
-        let lower = line.to_ascii_lowercase();
-        if lower.starts_with("connection:") || lower.starts_with("proxy-connection:") {
+        // Drop hop-by-hop headers; we set our own Connection below.
+        if is_hop_by_hop(&line.to_ascii_lowercase()) {
             continue;
         }
         out.push_str(line);

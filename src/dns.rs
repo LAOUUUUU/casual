@@ -6,7 +6,7 @@
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use serde::Serialize;
-use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
 #[derive(Args)]
@@ -42,13 +42,30 @@ pub fn run(args: DnsArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| crate::config::load().dns_server());
 
-    // Randomize the query ID (cheap anti-spoofing; no rand dependency).
-    let id = (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0)
-        & 0xFFFF) as u16;
+    // Randomize the query ID by mixing several entropy sources through a
+    // hasher — pid, wall clock, and a stack address (ASLR). No rand dependency.
+    let id = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::process::id().hash(&mut h);
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+            .hash(&mut h);
+        let probe = 0u8;
+        (std::ptr::from_ref(&probe) as usize).hash(&mut h);
+        (h.finish() & 0xFFFF) as u16
+    };
     let query = build_query(id, &args.host, qtype)?;
+
+    // Resolve the resolver up-front so we can verify the reply came from it,
+    // even when --server is a hostname (not just an IP literal).
+    let expected: Vec<IpAddr> = (server.as_str(), 53u16)
+        .to_socket_addrs()
+        .map(|it| it.map(|s| s.ip()).collect())
+        .unwrap_or_default();
+
     let sock = UdpSocket::bind("0.0.0.0:0").context("binding UDP socket")?;
     sock.set_read_timeout(Some(Duration::from_secs(5)))?;
     sock.send_to(&query, (server.as_str(), 53))
@@ -58,11 +75,9 @@ pub fn run(args: DnsArgs) -> Result<()> {
     let (n, src) = sock
         .recv_from(&mut buf)
         .context("no response from resolver")?;
-    // Reject an answer that didn't come from the resolver, or whose ID doesn't
-    // match — a spoofed reply from elsewhere shouldn't be trusted.
-    if let Ok(server_ip) = server.parse::<std::net::IpAddr>()
-        && (src.ip() != server_ip || src.port() != 53)
-    {
+    // Reject a reply that didn't come from the resolver, or whose ID doesn't
+    // match the query — a spoofed reply from elsewhere shouldn't be trusted.
+    if !expected.is_empty() && (!expected.contains(&src.ip()) || src.port() != 53) {
         anyhow::bail!("response came from {src}, not {server}:53 — ignoring");
     }
     if n < 2 || u16::from_be_bytes([buf[0], buf[1]]) != id {
