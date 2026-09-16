@@ -18,6 +18,7 @@ mod config;
 #[cfg(feature = "tui")]
 mod dash;
 pub mod dns;
+mod inspect;
 #[cfg(feature = "intercept")]
 mod intercept;
 mod learn;
@@ -80,6 +81,9 @@ enum Command {
 
     /// DNS lookup over UDP (record type A, AAAA, MX, TXT, CNAME, NS).
     Dns(dns::DnsArgs),
+
+    /// Static analysis of a binary: imports + flagged dangerous APIs.
+    Inspect(inspect::InspectArgs),
 
     /// Show the effective configuration and where it is read from.
     Config,
@@ -152,6 +156,7 @@ pub fn run() -> Result<()> {
             }
         }
         Command::Dns(args) => dns::run(args),
+        Command::Inspect(args) => inspect::run(args),
         Command::Config => config::show(),
         Command::Man => {
             clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;

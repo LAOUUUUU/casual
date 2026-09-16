@@ -11,6 +11,7 @@ runtime) are opt-in cargo features, so the base build stays lean.
 casual scan   <path>          # mini-AV: hash + signature DB + entropy heuristic
 casual proxy  [--port 8080]   # local HTTP(S) logging proxy for YOUR traffic
 casual dns    <host> [type]   # DNS over UDP, by hand (A/AAAA/MX/TXT/CNAME/NS)
+casual inspect <binary>       # static analysis: imports + flagged dangerous APIs
 casual plugin list|run ...    # native + WASM plugins (built-ins: hash/entropy/ports)
 casual learn                  # watch a model learn, live in the terminal
 casual live                   # interactive menu
@@ -105,6 +106,26 @@ casual dns example.com A --json         # structured output for scripts
 ```
 
 `--json` is also on `tls` and `probe`.
+
+### inspect — static binary analysis
+The "look at the binary for suspicious code" layer. Parses a Mach-O / ELF / PE
+file (via `goblin`), lists what it links against and imports, and flags
+dangerous API usage by category — code injection (`task_for_pid`,
+`CreateRemoteThread`), anti-debugging (`ptrace`), runtime code loading
+(`dlopen`), spawning shells (`execve`/`posix_spawn`), input capture
+(`CGEventTap`), and more.
+
+```bash
+casual inspect /usr/bin/ssh
+casual inspect ./target/release/casual --json
+casual inspect /bin/ls --all      # also dump every imported symbol
+```
+
+Same caveat as the scanner's entropy: importing these APIs is a *hint*, not
+proof — legit software calls them too. (On very recent macOS binaries that use
+chained fixups, imports are read from the symbol table as a fallback.) A
+signature-*rules* engine (YARA) that matches code patterns, not just symbol
+names, is the natural next layer.
 
 ### plugin — native and sandboxed
 Built-ins: `hash`, `entropy`, `ports`. Drop a compiled library into your plugin

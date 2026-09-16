@@ -21,6 +21,7 @@ rayon = "1"
 indicatif = "0.18"
 libloading = "0.8"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+goblin = "0.9"
 
 # --- optional, feature-gated. The default build stays lean. ---
 # intercept: decrypt your own HTTPS (your-own-CA, mitmproxy-style).
