@@ -276,6 +276,83 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
+/// A single request seen by the embedded proxy, handed to a callback. Used by
+/// the `dash` TUI so it can show live traffic without a separate proxy process
+/// or a log file.
+#[derive(Clone)]
+pub struct RequestEvent {
+    pub ts_ms: u128,
+    pub kind: &'static str,
+    pub method: String,
+    pub host: String,
+    pub port: u16,
+    pub target: String,
+}
+
+/// Run a minimal logging proxy that reports each request to `on_request` and
+/// tunnels the bytes. No tracing/stdout output (safe to run under a TUI), no
+/// policy/capture. Blocks forever; run it on its own thread.
+pub fn serve_events<F>(bind: &str, port: u16, on_request: F) -> Result<()>
+where
+    F: Fn(RequestEvent) + Send + Sync + 'static,
+{
+    let listener =
+        TcpListener::bind((bind, port)).with_context(|| format!("binding {bind}:{port}"))?;
+    let cb: Arc<dyn Fn(RequestEvent) + Send + Sync> = Arc::new(on_request);
+    for stream in listener.incoming() {
+        let Ok(client) = stream else { continue };
+        let cb = Arc::clone(&cb);
+        thread::spawn(move || {
+            let _ = handle_ev(client, cb.as_ref());
+        });
+    }
+    Ok(())
+}
+
+fn handle_ev(mut client: TcpStream, cb: &(dyn Fn(RequestEvent) + Send + Sync)) -> Result<()> {
+    client.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let head = read_head(&mut client)?;
+    client.set_read_timeout(None)?;
+    if head.is_empty() {
+        return Ok(());
+    }
+    let head_str = String::from_utf8_lossy(&head);
+    let first = head_str.lines().next().unwrap_or("");
+    let mut parts = first.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let target = parts.next().unwrap_or("").to_string();
+
+    if method.eq_ignore_ascii_case("CONNECT") {
+        let (host, port) = split_host_port(&target, 443);
+        cb(RequestEvent {
+            ts_ms: now_ms(),
+            kind: "connect",
+            method,
+            host: host.clone(),
+            port,
+            target: target.clone(),
+        });
+        let upstream = TcpStream::connect(&target)?;
+        client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
+        tunnel(client, upstream)?;
+    } else if !method.is_empty() {
+        let (host, port, path) = parse_http_target(&target);
+        cb(RequestEvent {
+            ts_ms: now_ms(),
+            kind: "http",
+            method,
+            host: host.clone(),
+            port,
+            target: target.clone(),
+        });
+        let mut upstream = TcpStream::connect(format!("{host}:{port}"))?;
+        let rebuilt = rewrite_head(&head_str, &path);
+        upstream.write_all(rebuilt.as_bytes())?;
+        tunnel(client, upstream)?;
+    }
+    Ok(())
+}
+
 fn read_head(stream: &mut TcpStream) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(1024);
     let mut byte = [0u8; 1];

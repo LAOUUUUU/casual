@@ -161,11 +161,21 @@ TLS 1.0: no   1.1: no   1.2: yes   1.3: yes
 ```
 
 ### tui — the live dashboard
+A btop-style full-screen dashboard. It runs its **own** proxy, so traffic shows
+up the moment you point a browser at it — no separate process needed.
+
 ```bash
 cargo build --release --features tui
-casual proxy --log-file traffic.jsonl   # terminal 1
-casual dash traffic.jsonl               # terminal 2 — live table + counters
+casual dash                 # or: casual dash --port 8081
 ```
+
+- **Top half — network monitor:** live request table, counters, and a req/s
+  sparkline, fed by the built-in proxy on `127.0.0.1:<port>`.
+- **Bottom half — plugins + console:** pick a plugin (it drops into the
+  console), or type any casual command (`dns example.com A`, `hash /etc/hosts`,
+  `scan .`) and press Enter — it runs and the output appears in the pane.
+- `Tab` cycles panels · `↑/↓` in the plugin list · `Esc` leaves the console ·
+  `q` or `Ctrl-C` quits.
 
 ### intercept — decrypt your own HTTPS
 Runs a local CA and re-signs each site (mitmproxy/Burp model). Only works on

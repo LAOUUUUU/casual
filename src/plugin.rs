@@ -61,6 +61,22 @@ pub fn list() {
     }
 }
 
+/// (name, description, usage) for every available plugin — built-in, native,
+/// and WASM. Used by the `dash` TUI to populate its plugin picker.
+#[cfg(feature = "tui")]
+pub fn catalog() -> Vec<(String, String, String)> {
+    all_plugins()
+        .iter()
+        .map(|p| {
+            (
+                p.name().to_string(),
+                p.description().to_string(),
+                p.usage().to_string(),
+            )
+        })
+        .collect()
+}
+
 pub fn run(name: &str, args: &[String]) -> Result<()> {
     let plugins = all_plugins();
     let plugin = plugins
