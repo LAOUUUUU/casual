@@ -99,7 +99,7 @@ enum Command {
     #[cfg(feature = "net")]
     Replay(netcmd::ReplayArgs),
 
-    /// Live TUI dashboard: built-in proxy + plugin console (needs `tui`).
+    /// Live TUI dashboard: TCP connections + plugin console (needs `tui`).
     #[cfg(feature = "tui")]
     Dash(dash::DashArgs),
 }

@@ -1,11 +1,11 @@
 //! `casual dash` (the `tui` feature) — a live, btop-style dashboard.
 //!
-//! Top half: a NETWORK monitor. The dashboard runs a proxy itself (on
-//! 127.0.0.1:<port>), so the moment you point a browser/app at it, requests
-//! stream into the table with live counters and a req/s sparkline.
+//! Top half: a live CONNECTIONS monitor. It samples the machine's established
+//! TCP connections (via `lsof`) every couple of seconds — process, local and
+//! remote address — so it's populated the moment you open it, no setup needed.
 //!
 //! Bottom half: a PLUGINS picker (left) and a CONSOLE (right). Select a plugin
-//! to drop its command into the console, or just type any casual command
+//! to drop it into the console with its usage hint, or type any casual command
 //! (`dns example.com A`, `hash /etc/hosts`, `scan .`) and press Enter — it runs
 //! as a subprocess and the output lands in the console pane.
 //!
@@ -22,45 +22,36 @@ use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, Borders, List, ListItem, ListState, Paragraph, Row, Sparkline, Table,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashSet, VecDeque};
+use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crate::proxy::{self, RequestEvent};
-use crate::{config, plugin};
+use crate::plugin;
 
 #[derive(Args)]
 pub struct DashArgs {
-    /// Port for the built-in proxy (default: config `proxy_port`, else 8080).
-    #[arg(short, long)]
-    pub port: Option<u16>,
+    /// Seconds between connection samples.
+    #[arg(short, long, default_value_t = 2)]
+    pub interval: u64,
 }
 
-/// Shared network state, written by the embedded proxy thread.
+struct Conn {
+    command: String,
+    pid: String,
+    laddr: String,
+    raddr: String,
+}
+
+/// Shared connection state, written by the sampler thread.
 #[derive(Default)]
-struct Net {
-    recent: VecDeque<RequestEvent>,
-    total: u64,
-    http: u64,
-    connect: u64,
-    hosts: HashMap<String, u64>,
+struct NetState {
+    conns: Vec<Conn>,
+    history: VecDeque<u64>,
     err: Option<String>,
-}
-
-impl Net {
-    fn push(&mut self, ev: RequestEvent) {
-        self.total += 1;
-        if ev.kind == "http" {
-            self.http += 1;
-        } else {
-            self.connect += 1;
-        }
-        *self.hosts.entry(ev.host.clone()).or_insert(0) += 1;
-        self.recent.push_front(ev);
-        self.recent.truncate(300);
-    }
+    samples: u64,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -79,31 +70,33 @@ struct App {
     running: usize,
     tx: Sender<Vec<String>>,
     rx: Receiver<Vec<String>>,
-    rate: VecDeque<u64>,
-    last_total: u64,
-    last_tick: Instant,
-    port: u16,
 }
 
 pub fn run(args: DashArgs) -> Result<()> {
-    let port = args.port.unwrap_or_else(|| config::load().proxy_port());
-    let net = Arc::new(Mutex::new(Net::default()));
+    let interval = Duration::from_secs(args.interval.max(1));
+    let net = Arc::new(Mutex::new(NetState::default()));
 
-    // Embedded proxy on its own thread; feeds the shared Net.
+    // Sampler thread: refresh the connection list on an interval.
     {
-        let ok = Arc::clone(&net);
-        let err = Arc::clone(&net);
+        let net = Arc::clone(&net);
         thread::spawn(move || {
-            let sink = Arc::clone(&ok);
-            let served = proxy::serve_events("127.0.0.1", port, move |ev| {
-                if let Ok(mut s) = sink.lock() {
-                    s.push(ev);
+            loop {
+                let res = sample_connections();
+                if let Ok(mut s) = net.lock() {
+                    match res {
+                        Ok(c) => {
+                            s.history.push_back(c.len() as u64);
+                            if s.history.len() > 60 {
+                                s.history.pop_front();
+                            }
+                            s.conns = c;
+                            s.err = None;
+                            s.samples += 1;
+                        }
+                        Err(e) => s.err = Some(e),
+                    }
                 }
-            });
-            if let Err(e) = served
-                && let Ok(mut s) = err.lock()
-            {
-                s.err = Some(e.to_string());
+                thread::sleep(interval);
             }
         });
     }
@@ -113,7 +106,7 @@ pub fn run(args: DashArgs) -> Result<()> {
     execute!(stdout, EnterAlternateScreen)?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    let result = run_loop(&mut term, &net, port);
+    let result = run_loop(&mut term, &net);
 
     disable_raw_mode()?;
     execute!(term.backend_mut(), LeaveAlternateScreen)?;
@@ -121,25 +114,50 @@ pub fn run(args: DashArgs) -> Result<()> {
     result
 }
 
-fn run_loop<B: Backend>(term: &mut Terminal<B>, net: &Arc<Mutex<Net>>, port: u16) -> Result<()> {
+/// Sample established TCP connections via lsof.
+fn sample_connections() -> std::result::Result<Vec<Conn>, String> {
+    let out = Command::new("lsof")
+        .args(["-nP", "-iTCP", "-sTCP:ESTABLISHED"])
+        .output()
+        .map_err(|e| format!("could not run lsof: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut conns = Vec::new();
+    for line in text.lines().skip(1) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 9 {
+            continue;
+        }
+        // The address field is the token containing "->" (local->remote).
+        let Some(name) = f.iter().find(|t| t.contains("->")) else {
+            continue;
+        };
+        let Some((l, r)) = name.split_once("->") else {
+            continue;
+        };
+        conns.push(Conn {
+            command: f[0].to_string(),
+            pid: f[1].to_string(),
+            laddr: l.to_string(),
+            raddr: r.to_string(),
+        });
+    }
+    Ok(conns)
+}
+
+fn run_loop<B: Backend>(term: &mut Terminal<B>, net: &Arc<Mutex<NetState>>) -> Result<()> {
     let (tx, rx) = mpsc::channel::<Vec<String>>();
     let mut app = App {
         focus: Focus::Net,
         plugins: plugin::catalog(),
         sel: 0,
         input: String::new(),
-        output: welcome(port),
+        output: welcome(),
         running: 0,
         tx,
         rx,
-        rate: VecDeque::new(),
-        last_total: 0,
-        last_tick: Instant::now(),
-        port,
     };
 
     loop {
-        // Absorb finished command output.
         while let Ok(lines) = app.rx.try_recv() {
             app.output.extend(lines);
             let cap = 1000;
@@ -147,17 +165,6 @@ fn run_loop<B: Backend>(term: &mut Terminal<B>, net: &Arc<Mutex<Net>>, port: u16
                 app.output.drain(0..app.output.len() - cap);
             }
             app.running = app.running.saturating_sub(1);
-        }
-
-        // Update the req/s history roughly once a second.
-        if app.last_tick.elapsed() >= Duration::from_secs(1) {
-            let total = net.lock().map(|s| s.total).unwrap_or(0);
-            app.rate.push_back(total.saturating_sub(app.last_total));
-            app.last_total = total;
-            if app.rate.len() > 60 {
-                app.rate.pop_front();
-            }
-            app.last_tick = Instant::now();
         }
 
         term.draw(|f| draw(f, &app, net))?;
@@ -198,7 +205,8 @@ fn handle_key(k: KeyEvent, app: &mut App) -> bool {
                 }
             }
             KeyCode::Enter => {
-                if let Some((name, _, _)) = app.plugins.get(app.sel) {
+                if let Some((name, _, usage)) = app.plugins.get(app.sel) {
+                    app.output.push(format!("hint: {usage}"));
                     app.input = format!("{name} ");
                     app.focus = Focus::Console;
                 }
@@ -222,8 +230,8 @@ fn next(f: Focus) -> Focus {
     }
 }
 
-/// Run the console input as `casual <args>` in a subprocess (so its output is
-/// captured instead of corrupting the TUI), appending the result when done.
+/// Run the console input as `casual <args>` in a subprocess (captured so it
+/// can't corrupt the TUI), appending the result when it finishes.
 fn run_command(app: &mut App) {
     let line = app.input.trim().to_string();
     app.input.clear();
@@ -256,7 +264,7 @@ fn run_command(app: &mut App) {
     thread::spawn(move || {
         let exe = std::env::current_exe().unwrap_or_else(|_| "casual".into());
         let mut lines = Vec::new();
-        match std::process::Command::new(exe).args(&args).output() {
+        match Command::new(exe).args(&args).output() {
             Ok(o) => {
                 for l in String::from_utf8_lossy(&o.stdout).lines() {
                     lines.push(format!("  {l}"));
@@ -277,19 +285,18 @@ fn run_command(app: &mut App) {
     });
 }
 
-fn welcome(port: u16) -> Vec<String> {
+fn welcome() -> Vec<String> {
     vec![
-        "casual dash — live network + plugin console".into(),
-        format!("proxy listening on http://127.0.0.1:{port}"),
-        "point your browser's HTTP+HTTPS proxy there to watch traffic above.".into(),
+        "casual dash — live connections + plugin console".into(),
+        "the top panel lists your machine's active TCP connections.".into(),
         "".into(),
-        "type a command and press Enter, e.g.:".into(),
+        "type a command here and press Enter, e.g.:".into(),
         "  dns example.com A      hash /etc/hosts      scan .".into(),
-        "Tab switches panels · q or ^C quits.".into(),
+        "or Tab to the plugins panel and pick one.".into(),
     ]
 }
 
-fn draw(f: &mut Frame, app: &App, net: &Arc<Mutex<Net>>) {
+fn draw(f: &mut Frame, app: &App, net: &Arc<Mutex<NetState>>) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -300,18 +307,14 @@ fn draw(f: &mut Frame, app: &App, net: &Arc<Mutex<Net>>) {
         ])
         .split(f.area());
 
-    draw_header(f, rows[0], app);
+    draw_header(f, rows[0]);
     draw_network(f, rows[1], app, net);
     draw_bottom(f, rows[2], app);
     draw_footer(f, rows[3], app);
 }
 
-fn draw_header(f: &mut Frame, area: Rect, app: &App) {
-    let line = format!(
-        " casual dash    proxy → http://127.0.0.1:{}    (set as your HTTP/HTTPS proxy)",
-        app.port
-    );
-    let p = Paragraph::new(line)
+fn draw_header(f: &mut Frame, area: Rect) {
+    let p = Paragraph::new(" casual dash    live TCP connections + plugin console")
         .style(
             Style::default()
                 .fg(Color::Cyan)
@@ -321,7 +324,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, area);
 }
 
-fn draw_network(f: &mut Frame, area: Rect, app: &App, net: &Arc<Mutex<Net>>) {
+fn draw_network(f: &mut Frame, area: Rect, app: &App, net: &Arc<Mutex<NetState>>) {
     let inner = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -332,61 +335,78 @@ fn draw_network(f: &mut Frame, area: Rect, app: &App, net: &Arc<Mutex<Net>>) {
         .split(area);
 
     let s = net.lock().ok();
-    let (total, http, https, hostn, err) = match &s {
-        Some(n) => (n.total, n.http, n.connect, n.hosts.len(), n.err.clone()),
-        None => (0, 0, 0, 0, None),
-    };
 
-    let stats = match err {
-        Some(e) => Paragraph::new(format!("proxy error: {e}"))
+    // Stats / error line.
+    let stats = match s.as_deref() {
+        Some(n) if n.err.is_some() => Paragraph::new(n.err.clone().unwrap())
             .style(Style::default().fg(Color::Red))
-            .block(Block::default().borders(Borders::ALL).title("network")),
-        None => Paragraph::new(format!(
-            "requests {total}   http {http}   https {https}   unique hosts {hostn}"
-        ))
-        .block(Block::default().borders(Borders::ALL).title("network")),
+            .block(Block::default().borders(Borders::ALL).title("connections")),
+        Some(n) => {
+            let hosts: HashSet<&str> = n.conns.iter().map(|c| remote_host(&c.raddr)).collect();
+            let procs: HashSet<&str> = n.conns.iter().map(|c| c.command.as_str()).collect();
+            let waiting = if n.samples == 0 {
+                "  (sampling…)"
+            } else {
+                ""
+            };
+            Paragraph::new(format!(
+                "connections {}   remote hosts {}   processes {}{waiting}",
+                n.conns.len(),
+                hosts.len(),
+                procs.len()
+            ))
+            .block(Block::default().borders(Borders::ALL).title("connections"))
+        }
+        None => {
+            Paragraph::new("").block(Block::default().borders(Borders::ALL).title("connections"))
+        }
     };
     f.render_widget(stats, inner[0]);
 
-    let rate: Vec<u64> = app.rate.iter().copied().collect();
+    let history: Vec<u64> = s
+        .as_deref()
+        .map(|n| n.history.iter().copied().collect())
+        .unwrap_or_default();
     let spark = Sparkline::default()
-        .data(&rate)
+        .data(&history)
         .style(Style::default().fg(Color::Green))
-        .block(Block::default().borders(Borders::ALL).title("requests/sec"));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("connection count"),
+        );
     f.render_widget(spark, inner[1]);
 
     let table_rows: Vec<Row> = s
-        .iter()
-        .flat_map(|n| n.recent.iter())
-        .map(|e| {
-            let color = if e.kind == "http" {
-                Color::Green
-            } else {
-                Color::Magenta
-            };
-            Row::new(vec![
-                hms(e.ts_ms),
-                e.kind.to_string(),
-                e.method.clone(),
-                format!("{}:{}", e.host, e.port),
-            ])
-            .style(Style::default().fg(color))
+        .as_deref()
+        .map(|n| {
+            n.conns
+                .iter()
+                .map(|c| {
+                    Row::new(vec![
+                        c.command.clone(),
+                        c.pid.clone(),
+                        c.laddr.clone(),
+                        c.raddr.clone(),
+                    ])
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
     let table = Table::new(
         table_rows,
         [
-            Constraint::Length(10),
-            Constraint::Length(9),
+            Constraint::Length(16),
             Constraint::Length(8),
+            Constraint::Percentage(38),
             Constraint::Min(10),
         ],
     )
     .header(
-        Row::new(vec!["time", "kind", "method", "host:port"])
+        Row::new(vec!["process", "pid", "local", "remote"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
     )
-    .block(border("recent requests", app.focus == Focus::Net));
+    .block(border("connections (lsof)", app.focus == Focus::Net));
     f.render_widget(table, inner[2]);
 }
 
@@ -396,7 +416,6 @@ fn draw_bottom(f: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Percentage(34), Constraint::Min(0)])
         .split(area);
 
-    // Plugins list.
     let items: Vec<ListItem> = app
         .plugins
         .iter()
@@ -420,26 +439,29 @@ fn draw_bottom(f: &mut Frame, area: Rect, app: &App) {
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, cols[0], &mut state);
 
-    // Console: output + input line.
     let con = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(3)])
         .split(cols[1]);
 
-    let visible = con[0].height.saturating_sub(2) as usize;
-    let start = app.output.len().saturating_sub(visible.max(1));
+    let visible = con[0].height.saturating_sub(2).max(1) as usize;
+    let start = app.output.len().saturating_sub(visible);
     let lines: Vec<Line> = app.output[start..]
         .iter()
         .map(|l| {
             if l.starts_with("$ ") {
                 Line::styled(l.clone(), Style::default().fg(Color::Cyan))
+            } else if l.starts_with("hint:") {
+                Line::styled(l.clone(), Style::default().fg(Color::Yellow))
             } else {
                 Line::raw(l.clone())
             }
         })
         .collect();
-    let out = Paragraph::new(lines).block(border("console", false));
-    f.render_widget(out, con[0]);
+    f.render_widget(
+        Paragraph::new(lines).block(border("console", false)),
+        con[0],
+    );
 
     let cursor = if app.focus == Focus::Console {
         "█"
@@ -464,7 +486,6 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// A block whose border is highlighted when its panel has focus.
 fn border(title: &str, focused: bool) -> Block<'_> {
     let color = if focused {
         Color::Cyan
@@ -477,12 +498,10 @@ fn border(title: &str, focused: bool) -> Block<'_> {
         .title(title)
 }
 
-fn hms(ts_ms: u128) -> String {
-    let secs = (ts_ms / 1000) % 86_400;
-    format!(
-        "{:02}:{:02}:{:02}",
-        secs / 3600,
-        (secs % 3600) / 60,
-        secs % 60
-    )
+/// Strip the port from a remote address (`1.2.3.4:443` or `[::1]:443`).
+fn remote_host(addr: &str) -> &str {
+    match addr.rsplit_once(':') {
+        Some((h, _)) => h,
+        None => addr,
+    }
 }
