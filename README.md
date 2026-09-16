@@ -147,9 +147,16 @@ casual tls internal.corp --cacert my-root-ca.pem     # trust an extra root CA
 ```
 
 `casual tls` doubles as a mini SSL audit: it flags expired/soon-to-expire and
-self-signed certs, whether the server still requires TLS 1.2, and whether it
-offers TLS 1.3. (rustls speaks only TLS 1.2/1.3, so 1.0/1.1 aren't probed.)
+self-signed certs and probes **all four protocol versions** — TLS 1.2/1.3 via
+rustls, and TLS 1.0/1.1 via a hand-crafted ClientHello on the raw wire (rustls
+refuses to speak them), warning when a server still accepts the deprecated ones.
 Decrypting your own HTTPS traffic in full is the `intercept` feature below.
+
+```
+$ casual tls github.com
+negotiated TLSv1_3   validated: yes
+TLS 1.0: no   1.1: no   1.2: yes   1.3: yes
+```
 
 ### tui — the live dashboard
 ```bash

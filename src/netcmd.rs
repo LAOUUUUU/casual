@@ -89,12 +89,19 @@ struct TlsAudit {
     host: String,
     port: u16,
     negotiated: Option<String>,
+    tls10: bool,
+    tls11: bool,
     tls12: bool,
     tls13: bool,
     validated: bool,
     warnings: Vec<String>,
     chain: Vec<CertInfo>,
 }
+
+// Legacy TLS record/handshake versions (rustls refuses to speak these, so we
+// probe them by hand on the raw wire — see legacy_version_supported).
+const TLS10: u16 = 0x0301;
+const TLS11: u16 = 0x0302;
 
 #[derive(serde::Serialize)]
 struct ProbeResult {
@@ -110,29 +117,39 @@ pub fn tls(args: TlsArgs) -> Result<()> {
     install_provider();
     let (host, port) = split_target(&args.target, 443);
 
-    // Fetch the chain with the user's options; if validation fails and they
-    // didn't ask for --insecure, retry insecurely just to display the chain.
+    // Fetch the chain with the user's options; if validation fails, retry
+    // insecurely just to display the chain. If even that fails (e.g. a
+    // TLS 1.0/1.1-only server, which rustls can't speak), carry on with no
+    // chain — the legacy probe below still reports what the server supports.
     let (chain, negotiated, validated) = match do_handshake(&host, port, &args.tls) {
         Ok((c, v)) => (c, v, true),
-        Err(_) if !args.tls.insecure => {
+        Err(_) => {
             let insecure = TlsOpts {
                 insecure: true,
                 cacert: None,
             };
-            let (c, v) = do_handshake(&host, port, &insecure)
-                .context("TLS handshake failed even without verification")?;
-            (c, v, false)
+            match do_handshake(&host, port, &insecure) {
+                Ok((c, v)) => (c, v, false),
+                Err(_) => (Vec::new(), None, false),
+            }
         }
-        Err(e) => return Err(e),
     };
 
-    // Version support (probed insecurely so cert validity doesn't skew it).
+    // Version support. 1.2/1.3 via rustls; 1.0/1.1 via a raw ClientHello,
+    // since rustls won't speak them. All probed independently of cert validity.
+    let tls10 = legacy_version_supported(&host, port, TLS10);
+    let tls11 = legacy_version_supported(&host, port, TLS11);
     let tls12 = version_supported(&host, port, &rustls::version::TLS12);
     let tls13 = version_supported(&host, port, &rustls::version::TLS13);
 
     let mut warnings = Vec::new();
-    if !validated {
+    if chain.is_empty() {
+        warnings.push("no TLS 1.2/1.3 session established — cert chain not retrieved (server may be TLS 1.0/1.1 only)".into());
+    } else if !validated {
         warnings.push("certificate did NOT validate against trusted roots (shown anyway; pass --cacert or --insecure)".into());
+    }
+    if tls10 || tls11 {
+        warnings.push("server accepts deprecated TLS 1.0/1.1 — should be disabled".into());
     }
     if let Some(leaf) = chain.first() {
         match leaf.days_left {
@@ -156,6 +173,8 @@ pub fn tls(args: TlsArgs) -> Result<()> {
         host: host.clone(),
         port,
         negotiated,
+        tls10,
+        tls11,
         tls12,
         tls13,
         validated,
@@ -175,7 +194,9 @@ pub fn tls(args: TlsArgs) -> Result<()> {
         if audit.validated { "yes" } else { "NO" }
     );
     println!(
-        "TLS 1.2: {}   TLS 1.3: {}   (1.0/1.1 not probed — rustls speaks 1.2/1.3)",
+        "TLS 1.0: {}   1.1: {}   1.2: {}   1.3: {}",
+        yesno(audit.tls10),
+        yesno(audit.tls11),
         yesno(audit.tls12),
         yesno(audit.tls13)
     );
@@ -432,6 +453,108 @@ fn install_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
+/// Probe, on the raw wire, whether the server negotiates exactly this legacy
+/// TLS version. We hand-craft a ClientHello advertising `version` and read the
+/// ServerHello's version back (or an alert / closed connection = no).
+fn legacy_version_supported(host: &str, port: u16, version: u16) -> bool {
+    let hello = build_client_hello(host, version);
+    let Ok(mut sock) = TcpStream::connect((host, port)) else {
+        return false;
+    };
+    let _ = sock.set_read_timeout(Some(Duration::from_secs(8)));
+    if sock.write_all(&hello).is_err() {
+        return false;
+    }
+    // TLS record header: content_type(1) legacy_version(2) length(2).
+    let mut hdr = [0u8; 5];
+    if sock.read_exact(&mut hdr).is_err() {
+        return false;
+    }
+    let content_type = hdr[0];
+    let len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+    // We need a handshake record (22) whose body is a ServerHello (type 2)
+    // beginning handshake_type(1) length(3) server_version(2).
+    if content_type != 22 || len < 6 {
+        return false;
+    }
+    let mut body = [0u8; 6];
+    if sock.read_exact(&mut body).is_err() {
+        return false;
+    }
+    body[0] == 2 && u16::from_be_bytes([body[4], body[5]]) == version
+}
+
+fn build_client_hello(host: &str, version: u16) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&version.to_be_bytes()); // client_version
+    body.extend_from_slice(&[0x11u8; 32]); // random (fixed is fine for a probe)
+    body.push(0); // session_id length
+
+    // A spread of classic TLS 1.0/1.1-era cipher suites + the renegotiation SCSV.
+    let suites: [u16; 9] = [
+        0xC014, 0xC013, 0xC00A, 0xC009, 0x0035, 0x002F, 0x000A, 0x0005, 0x00FF,
+    ];
+    body.extend_from_slice(&((suites.len() * 2) as u16).to_be_bytes());
+    for s in suites {
+        body.extend_from_slice(&s.to_be_bytes());
+    }
+    body.push(1); // one compression method
+    body.push(0); // null compression
+
+    let ext = build_extensions(host);
+    body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+    body.extend_from_slice(&ext);
+
+    // Wrap in a handshake message, then a TLS record.
+    let mut hs = Vec::with_capacity(body.len() + 4);
+    hs.push(1); // client_hello
+    let l = body.len();
+    hs.extend_from_slice(&[(l >> 16) as u8, (l >> 8) as u8, l as u8]);
+    hs.extend_from_slice(&body);
+
+    let mut rec = Vec::with_capacity(hs.len() + 5);
+    rec.push(22); // handshake
+    rec.extend_from_slice(&TLS10.to_be_bytes()); // record layer version
+    rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+    rec.extend_from_slice(&hs);
+    rec
+}
+
+fn build_extensions(host: &str) -> Vec<u8> {
+    let mut ext = Vec::new();
+
+    // SNI (host_name) — skip for bare IPs.
+    if !host.is_empty() && host.parse::<std::net::IpAddr>().is_err() {
+        let name = host.as_bytes();
+        let mut sni = Vec::new();
+        sni.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes()); // list length
+        sni.push(0); // name_type = host_name
+        sni.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        sni.extend_from_slice(name);
+        ext.extend_from_slice(&0x0000u16.to_be_bytes());
+        ext.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&sni);
+    }
+
+    // supported_groups: secp256r1, secp384r1 (so ECDHE suites can be chosen).
+    let groups: [u16; 2] = [0x0017, 0x0018];
+    let mut g = Vec::new();
+    g.extend_from_slice(&((groups.len() * 2) as u16).to_be_bytes());
+    for x in groups {
+        g.extend_from_slice(&x.to_be_bytes());
+    }
+    ext.extend_from_slice(&0x000au16.to_be_bytes());
+    ext.extend_from_slice(&(g.len() as u16).to_be_bytes());
+    ext.extend_from_slice(&g);
+
+    // ec_point_formats: uncompressed.
+    ext.extend_from_slice(&0x000bu16.to_be_bytes());
+    ext.extend_from_slice(&2u16.to_be_bytes());
+    ext.extend_from_slice(&[1, 0]);
+
+    ext
+}
+
 fn build_client_config(
     opts: &TlsOpts,
     versions: Option<&[&'static rustls::SupportedProtocolVersion]>,
@@ -574,4 +697,35 @@ fn parse_url(url: &str) -> Result<(String, String, u16, String)> {
     };
     let (host, port) = split_target(authority, default_port);
     Ok((scheme.to_string(), host, port, path.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_hello_is_well_formed() {
+        let rec = build_client_hello("example.com", TLS10);
+        // record: handshake(22), version 0x0301, length, then handshake body
+        assert_eq!(rec[0], 22);
+        assert_eq!(&rec[1..3], &[0x03, 0x01]);
+        let rec_len = u16::from_be_bytes([rec[3], rec[4]]) as usize;
+        assert_eq!(rec_len, rec.len() - 5);
+        // handshake: client_hello(1), 3-byte length, client_version
+        assert_eq!(rec[5], 1);
+        assert_eq!(&rec[9..11], &[0x03, 0x01]); // advertised client_version = TLS 1.0
+    }
+
+    #[test]
+    fn parses_url_variants() {
+        assert_eq!(
+            parse_url("https://h/p").unwrap(),
+            ("https".into(), "h".into(), 443, "/p".into())
+        );
+        assert_eq!(
+            parse_url("http://h:81").unwrap(),
+            ("http".into(), "h".into(), 81, "/".into())
+        );
+        assert!(parse_url("ftp://x").is_err());
+    }
 }
