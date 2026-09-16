@@ -114,32 +114,37 @@ pub fn run(args: DashArgs) -> Result<()> {
     result
 }
 
-/// Sample established TCP connections via lsof.
+/// Sample established TCP connections via lsof, using `-F` field output so we
+/// don't have to parse whitespace-delimited columns (which break on command
+/// names containing spaces). Each field is one line, tagged by its first char:
+/// `p`<pid>, `c`<command>, `n`<local->remote>.
 fn sample_connections() -> std::result::Result<Vec<Conn>, String> {
     let out = Command::new("lsof")
-        .args(["-nP", "-iTCP", "-sTCP:ESTABLISHED"])
+        .args(["-nP", "-iTCP", "-sTCP:ESTABLISHED", "-Fpcn"])
         .output()
         .map_err(|e| format!("could not run lsof: {e}"))?;
     let text = String::from_utf8_lossy(&out.stdout);
     let mut conns = Vec::new();
-    for line in text.lines().skip(1) {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        if f.len() < 9 {
+    let (mut pid, mut cmd) = (String::new(), String::new());
+    for line in text.lines() {
+        let Some((tag, val)) = line.split_at_checked(1) else {
             continue;
+        };
+        match tag {
+            "p" => pid = val.to_string(),
+            "c" => cmd = val.to_string(),
+            "n" => {
+                if let Some((l, r)) = val.split_once("->") {
+                    conns.push(Conn {
+                        command: cmd.clone(),
+                        pid: pid.clone(),
+                        laddr: l.to_string(),
+                        raddr: r.to_string(),
+                    });
+                }
+            }
+            _ => {}
         }
-        // The address field is the token containing "->" (local->remote).
-        let Some(name) = f.iter().find(|t| t.contains("->")) else {
-            continue;
-        };
-        let Some((l, r)) = name.split_once("->") else {
-            continue;
-        };
-        conns.push(Conn {
-            command: f[0].to_string(),
-            pid: f[1].to_string(),
-            laddr: l.to_string(),
-            raddr: r.to_string(),
-        });
     }
     Ok(conns)
 }

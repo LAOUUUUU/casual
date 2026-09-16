@@ -196,21 +196,27 @@ TLS 1.0: no   1.1: no   1.2: yes   1.3: yes
 ```
 
 ### tui — the live dashboard
-A btop-style full-screen dashboard. It runs its **own** proxy, so traffic shows
-up the moment you point a browser at it — no separate process needed.
+A btop-style full-screen dashboard. It populates on its own — no proxy to
+configure.
 
 ```bash
 cargo build --release --features tui
-casual dash                 # or: casual dash --port 8081
+casual dash                 # or: casual dash --interval 5
 ```
 
-- **Top half — network monitor:** live request table, counters, and a req/s
-  sparkline, fed by the built-in proxy on `127.0.0.1:<port>`.
+- **Top half — connections monitor:** your machine's live established TCP
+  connections (process, pid, local, remote) sampled via `lsof`, with a
+  connection-count sparkline.
 - **Bottom half — plugins + console:** pick a plugin (it drops into the
-  console), or type any casual command (`dns example.com A`, `hash /etc/hosts`,
-  `scan .`) and press Enter — it runs and the output appears in the pane.
+  console with a usage hint), or type any casual command (`dns example.com A`,
+  `hash /etc/hosts`, `scan .`) and press Enter — it runs and the output appears
+  in the pane.
 - `Tab` cycles panels · `↑/↓` in the plugin list · `Esc` leaves the console ·
   `q` or `Ctrl-C` quits.
+
+(Needs `lsof`, present on macOS and most Linux; the panel shows an error if it's
+missing. Console commands are split on whitespace, so paths with spaces aren't
+supported there yet.)
 
 ### intercept — decrypt your own HTTPS
 Runs a local CA and re-signs each site (mitmproxy/Burp model). Only works on

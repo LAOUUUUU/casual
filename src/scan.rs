@@ -24,6 +24,11 @@ use walkdir::WalkDir;
 
 /// How many bytes of a file we keep in memory for pattern matching. The hash
 /// and entropy are always streamed, so only pattern search is capped.
+///
+/// LIMITATION: patterns are only matched within the first `MAX_PATTERN_BYTES`.
+/// A file larger than this is skipped for pattern matching entirely, so a
+/// byte-pattern signature can be evaded by prepending/appending padding. Hash
+/// signatures still fire on the whole file. A real engine slides the window.
 const MAX_PATTERN_BYTES: usize = 5 * 1024 * 1024;
 
 #[derive(Args)]
@@ -259,9 +264,10 @@ fn expected_high_entropy(path: &Path) -> bool {
 }
 
 fn home_dir() -> Result<PathBuf> {
-    std::env::var("HOME")
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE")) // Windows
         .map(PathBuf::from)
-        .context("HOME is not set; pass a path to scan explicitly")
+        .context("no HOME/USERPROFILE set; pass a path to scan explicitly")
 }
 
 fn move_into(path: &str, dir: &Path) -> Result<String> {
@@ -384,12 +390,15 @@ fn scan_archive(bytes: &[u8], db: &SignatureDb, entropy_threshold: f64) -> (Verd
         let Ok(mut entry) = zip.by_index(i) else {
             continue;
         };
-        if !entry.is_file() || entry.size() > MAX_ENTRY {
+        if !entry.is_file() {
             continue;
         }
         let name = entry.name().to_string();
-        let mut buf = Vec::with_capacity(entry.size() as usize);
-        if entry.read_to_end(&mut buf).is_err() {
+        // Bound the ACTUAL bytes read, not the entry's self-reported size — a
+        // zip bomb claims a small size and decompresses to gigabytes. Don't
+        // preallocate from the size field either.
+        let mut buf = Vec::new();
+        if (&mut entry).take(MAX_ENTRY).read_to_end(&mut buf).is_err() {
             continue;
         }
 

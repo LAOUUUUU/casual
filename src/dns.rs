@@ -42,16 +42,32 @@ pub fn run(args: DnsArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| crate::config::load().dns_server());
 
-    let query = build_query(0x1234, &args.host, qtype);
+    // Randomize the query ID (cheap anti-spoofing; no rand dependency).
+    let id = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0)
+        & 0xFFFF) as u16;
+    let query = build_query(id, &args.host, qtype)?;
     let sock = UdpSocket::bind("0.0.0.0:0").context("binding UDP socket")?;
     sock.set_read_timeout(Some(Duration::from_secs(5)))?;
     sock.send_to(&query, (server.as_str(), 53))
         .with_context(|| format!("sending query to {server}:53"))?;
 
     let mut buf = [0u8; 4096];
-    let (n, _) = sock
+    let (n, src) = sock
         .recv_from(&mut buf)
         .context("no response from resolver")?;
+    // Reject an answer that didn't come from the resolver, or whose ID doesn't
+    // match — a spoofed reply from elsewhere shouldn't be trusted.
+    if let Ok(server_ip) = server.parse::<std::net::IpAddr>()
+        && (src.ip() != server_ip || src.port() != 53)
+    {
+        anyhow::bail!("response came from {src}, not {server}:53 — ignoring");
+    }
+    if n < 2 || u16::from_be_bytes([buf[0], buf[1]]) != id {
+        anyhow::bail!("response ID did not match the query — ignoring");
+    }
     let msg = &buf[..n];
 
     let answers = parse_response(msg, &args.host)?;
@@ -97,7 +113,7 @@ fn type_name(t: u16) -> &'static str {
     }
 }
 
-pub fn build_query(id: u16, name: &str, qtype: u16) -> Vec<u8> {
+pub fn build_query(id: u16, name: &str, qtype: u16) -> Result<Vec<u8>> {
     let mut q = Vec::with_capacity(32);
     q.extend_from_slice(&id.to_be_bytes());
     q.extend_from_slice(&0x0100u16.to_be_bytes()); // flags: recursion desired
@@ -109,13 +125,17 @@ pub fn build_query(id: u16, name: &str, qtype: u16) -> Vec<u8> {
         if label.is_empty() {
             continue;
         }
+        // DNS labels are at most 63 bytes; anything longer can't be encoded.
+        if label.len() > 63 {
+            bail!("DNS label '{label}' exceeds 63 bytes");
+        }
         q.push(label.len() as u8);
         q.extend_from_slice(label.as_bytes());
     }
     q.push(0); // root label
     q.extend_from_slice(&qtype.to_be_bytes());
     q.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
-    q
+    Ok(q)
 }
 
 pub fn parse_response(msg: &[u8], host: &str) -> Result<Vec<Answer>> {
@@ -267,7 +287,7 @@ mod tests {
 
     #[test]
     fn query_has_one_question() {
-        let q = build_query(0xABCD, "example.com", 1);
+        let q = build_query(0xABCD, "example.com", 1).unwrap();
         assert_eq!(&q[0..2], &[0xAB, 0xCD]);
         assert_eq!(u16::from_be_bytes([q[4], q[5]]), 1); // QDCOUNT
         // labels: 7"example" 3"com" 0

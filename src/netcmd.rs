@@ -212,6 +212,7 @@ pub fn tls(args: TlsArgs) -> Result<()> {
         println!("    issuer:  {}", info.issuer);
         println!("    valid:   {} -> {}", info.not_before, info.not_after);
         match info.days_left {
+            Some(d) if d < 0 => println!("    EXPIRED {} days ago", -d),
             Some(d) => println!("    expires in {d} days"),
             None => println!("    validity unparseable"),
         }
@@ -272,6 +273,7 @@ fn version_supported(host: &str, port: u16, v: &'static rustls::SupportedProtoco
 }
 
 fn parse_cert(der: &[u8]) -> CertInfo {
+    use x509_parser::extensions::GeneralName;
     match x509_parser::parse_x509_certificate(der) {
         Ok((_, cert)) => {
             let sans = cert
@@ -282,16 +284,29 @@ fn parse_cert(der: &[u8]) -> CertInfo {
                     san.value
                         .general_names
                         .iter()
-                        .map(|g| format!("{g:?}"))
+                        .map(|g| match g {
+                            GeneralName::DNSName(s) => (*s).to_string(),
+                            GeneralName::URI(s) => (*s).to_string(),
+                            GeneralName::RFC822Name(s) => format!("email:{s}"),
+                            GeneralName::IPAddress(b) => format!("ip:{}", fmt_ip(b)),
+                            other => format!("{other:?}"),
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
+            // Compute days-left ourselves: x509's time_to_expiration() returns
+            // None for already-expired certs, which would read as "unparseable".
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let days_left = (cert.validity().not_after.timestamp() - now) / 86_400;
             CertInfo {
                 subject: cert.subject().to_string(),
                 issuer: cert.issuer().to_string(),
                 not_before: cert.validity().not_before.to_string(),
                 not_after: cert.validity().not_after.to_string(),
-                days_left: cert.validity().time_to_expiration().map(|d| d.whole_days()),
+                days_left: Some(days_left),
                 sans,
             }
         }
@@ -408,7 +423,7 @@ pub fn replay(args: ReplayArgs) -> Result<()> {
             _ => (
                 "https".into(),
                 rec.host.clone(),
-                443,
+                rec.port,
                 "/".into(),
                 "GET".into(),
             ),
@@ -676,7 +691,35 @@ fn yesno(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
 }
 
+/// Format a raw IP address from a SAN (4 bytes = IPv4, 16 = IPv6).
+fn fmt_ip(b: &[u8]) -> String {
+    match b.len() {
+        4 => format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]),
+        16 => {
+            let mut segs = Vec::with_capacity(8);
+            for i in 0..8 {
+                segs.push(format!(
+                    "{:x}",
+                    u16::from_be_bytes([b[i * 2], b[i * 2 + 1]])
+                ));
+            }
+            segs.join(":")
+        }
+        _ => format!("{b:?}"),
+    }
+}
+
 fn split_target(t: &str, default_port: u16) -> (String, u16) {
+    // Bracketed IPv6 ([::1] / [::1]:8443) — strip the brackets.
+    if let Some(rest) = t.strip_prefix('[')
+        && let Some((h, tail)) = rest.split_once(']')
+    {
+        let port = tail
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(default_port);
+        return (h.to_string(), port);
+    }
     match t.rsplit_once(':') {
         Some((h, p)) => (h.to_string(), p.parse().unwrap_or(default_port)),
         None => (t.to_string(), default_port),
@@ -684,6 +727,9 @@ fn split_target(t: &str, default_port: u16) -> (String, u16) {
 }
 
 fn parse_url(url: &str) -> Result<(String, String, u16, String)> {
+    if url.chars().any(|c| c.is_whitespace()) {
+        bail!("URL must not contain whitespace (percent-encode spaces as %20)");
+    }
     let (scheme, rest, default_port) = if let Some(r) = url.strip_prefix("https://") {
         ("https", r, 443)
     } else if let Some(r) = url.strip_prefix("http://") {

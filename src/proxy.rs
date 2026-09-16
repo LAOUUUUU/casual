@@ -83,17 +83,8 @@ struct ProxyState {
 }
 
 impl ProxyState {
-    /// Policy check: blocked substrings win; a non-empty allow-list means only
-    /// matching hosts pass.
     fn allowed(&self, host: &str) -> bool {
-        if self.block.iter().any(|b| host.contains(b.as_str())) {
-            return false;
-        }
-        if !self.allow_only.is_empty() && !self.allow_only.iter().any(|a| host.contains(a.as_str()))
-        {
-            return false;
-        }
-        true
+        host_allowed(host, &self.block, &self.allow_only)
     }
 
     fn record(&self, kind: &str, method: &str, target: &str, host: &str, port: u16) {
@@ -121,6 +112,12 @@ pub fn run(args: ProxyArgs) -> Result<()> {
     if args.intercept {
         #[cfg(feature = "intercept")]
         {
+            if args.log_file.is_some() || args.capture_dir.is_some() {
+                anyhow::bail!(
+                    "--log-file and --capture-dir aren't supported with --intercept yet \
+                     (--block/--allow-only are)."
+                );
+            }
             return crate::intercept::run(args);
         }
         #[cfg(not(feature = "intercept"))]
@@ -155,6 +152,10 @@ pub fn run(args: ProxyArgs) -> Result<()> {
                     .open(path)
                     .with_context(|| format!("opening log file {}", path.display()))?;
                 info!("logging requests as JSONL to {}", path.display());
+                warn!(
+                    "logged URLs can contain query-string secrets (?token=…); keep {} private",
+                    path.display()
+                );
                 Some(Mutex::new(BufWriter::new(file)))
             }
             None => None,
@@ -222,10 +223,16 @@ fn handle(mut client: TcpStream, state: &ProxyState) -> Result<()> {
             let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
             return Ok(());
         }
-        info!(target = %target, "HTTPS tunnel");
+        debug!(target = %target, "HTTPS tunnel");
         state.record("connect", &method, &target, &host, port);
-        let upstream =
-            TcpStream::connect(&target).with_context(|| format!("connecting upstream {target}"))?;
+        let upstream = match TcpStream::connect(&target) {
+            Ok(u) => u,
+            Err(e) => {
+                debug!("upstream connect {target} failed: {e}");
+                let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+                return Ok(());
+            }
+        };
         client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
         tunnel(client, upstream)?;
     } else if !method.is_empty() {
@@ -235,17 +242,23 @@ fn handle(mut client: TcpStream, state: &ProxyState) -> Result<()> {
             let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
             return Ok(());
         }
-        info!(%method, url = %target, "HTTP request");
+        debug!(%method, url = %target, "HTTP request");
         for line in head_str.lines().skip(1) {
             if line.is_empty() {
                 break;
             }
-            debug!("  {line}");
+            debug!("  {}", redact(line));
         }
         state.record("http", &method, &target, &host, port);
         let upstream_addr = format!("{host}:{port}");
-        let mut upstream = TcpStream::connect(&upstream_addr)
-            .with_context(|| format!("connecting upstream {upstream_addr}"))?;
+        let mut upstream = match TcpStream::connect(&upstream_addr) {
+            Ok(u) => u,
+            Err(e) => {
+                debug!("upstream connect {upstream_addr} failed: {e}");
+                let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+                return Ok(());
+            }
+        };
         let rebuilt = rewrite_head(&head_str, &path);
         upstream.write_all(rebuilt.as_bytes())?;
 
@@ -362,18 +375,67 @@ fn read_head(stream: &mut TcpStream) -> Result<Vec<u8>> {
             break;
         }
         buf.push(byte[0]);
-        if buf.ends_with(b"\r\n\r\n") || buf.len() >= MAX_HEAD_BYTES {
+        if buf.ends_with(b"\r\n\r\n") {
             break;
+        }
+        // Don't silently truncate an over-long head and forward a partial
+        // request — that's a request-smuggling primitive. Reject instead.
+        if buf.len() >= MAX_HEAD_BYTES {
+            anyhow::bail!("request head exceeded {MAX_HEAD_BYTES} bytes");
         }
     }
     Ok(buf)
 }
 
+/// Split an authority into host + port, handling bracketed IPv6 (`[::1]:8080`)
+/// by stripping the brackets so the host is a usable address.
 fn split_host_port(authority: &str, default_port: u16) -> (String, u16) {
+    if let Some(rest) = authority.strip_prefix('[')
+        && let Some((h, tail)) = rest.split_once(']')
+    {
+        let port = tail
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(default_port);
+        return (h.to_string(), port);
+    }
     match authority.rsplit_once(':') {
         Some((h, p)) => (h.to_string(), p.parse().unwrap_or(default_port)),
         None => (authority.to_string(), default_port),
     }
+}
+
+/// Shared allow/block policy for the proxy and intercept. Blocked substrings
+/// win; a non-empty allow-list permits only an exact host or a dot-boundary
+/// subdomain of an entry (so `mycorp.com` does not match `evil-mycorp.com`).
+pub fn host_allowed(host: &str, block: &[String], allow_only: &[String]) -> bool {
+    let host = host.to_ascii_lowercase();
+    if block.iter().any(|b| host.contains(&b.to_ascii_lowercase())) {
+        return false;
+    }
+    if allow_only.is_empty() {
+        return true;
+    }
+    allow_only.iter().any(|a| {
+        let a = a.to_ascii_lowercase();
+        host == a || host.ends_with(&format!(".{a}"))
+    })
+}
+
+/// Redact secret header values before debug-logging a request head.
+fn redact(line: &str) -> String {
+    const SECRET: &[&str] = &[
+        "authorization:",
+        "proxy-authorization:",
+        "cookie:",
+        "set-cookie:",
+    ];
+    let lower = line.to_ascii_lowercase();
+    if let Some(prefix) = SECRET.iter().find(|k| lower.starts_with(**k)) {
+        let name = &line[..prefix.len()];
+        return format!("{name} <redacted>");
+    }
+    line.to_string()
 }
 
 pub fn parse_http_target(target: &str) -> (String, u16, String) {
@@ -399,6 +461,11 @@ pub fn rewrite_head(head: &str, path: &str) -> String {
 
     let mut out = format!("{method} {path} {version}\r\n");
     for line in lines {
+        // Hop-by-hop proxy headers must not leak to the origin server.
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("proxy-connection:") || lower.starts_with("proxy-authorization:") {
+            continue;
+        }
         out.push_str(line);
         out.push_str("\r\n");
     }

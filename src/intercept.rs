@@ -26,7 +26,7 @@ use rustls::{
 };
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use tracing::{debug, info, warn};
@@ -45,6 +45,8 @@ pub fn run(args: ProxyArgs) -> Result<()> {
         "no intercept CA found. Run `casual ca` once, then install the printed certificate.",
     )?);
     let client_config = Arc::new(build_client_config());
+    // Same allow/block policy as the plain proxy.
+    let policy = Arc::new((args.block.clone(), args.allow_only.clone()));
 
     let port = args
         .port
@@ -64,8 +66,9 @@ pub fn run(args: ProxyArgs) -> Result<()> {
         };
         let ca = Arc::clone(&ca);
         let cc = Arc::clone(&client_config);
+        let policy = Arc::clone(&policy);
         thread::spawn(move || {
-            if let Err(e) = handle(client, &ca, &cc) {
+            if let Err(e) = handle(client, &ca, &cc, &policy) {
                 debug!("connection ended: {e}");
             }
         });
@@ -73,7 +76,12 @@ pub fn run(args: ProxyArgs) -> Result<()> {
     Ok(())
 }
 
-fn handle(mut client: TcpStream, ca: &Ca, client_config: &Arc<ClientConfig>) -> Result<()> {
+fn handle(
+    mut client: TcpStream,
+    ca: &Ca,
+    client_config: &Arc<ClientConfig>,
+    policy: &(Vec<String>, Vec<String>),
+) -> Result<()> {
     let head = read_head(&mut client)?;
     if head.is_empty() {
         return Ok(());
@@ -86,11 +94,22 @@ fn handle(mut client: TcpStream, ca: &Ca, client_config: &Arc<ClientConfig>) -> 
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = split_host_port(&target, 443);
+        if !crate::proxy::host_allowed(&host, &policy.0, &policy.1) {
+            warn!(%host, "blocked by policy");
+            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+            return Ok(());
+        }
         client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
         if let Err(e) = intercept_tls(client, &host, port, ca, client_config) {
             debug!("intercept {host}:{port} failed: {e}");
         }
     } else if !method.is_empty() {
+        let (host, ..) = parse_http_target(&target);
+        if !crate::proxy::host_allowed(&host, &policy.0, &policy.1) {
+            warn!(%host, "blocked by policy");
+            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+            return Ok(());
+        }
         // Plain HTTP needs no decryption; forward it and log.
         forward_plain(client, &head_str, &method, &target)?;
     }
@@ -128,6 +147,12 @@ fn intercept_tls(
     let path = it.next().unwrap_or("");
     info!(%method, host = %host, %path, "intercepted HTTPS request");
 
+    // We can't relay a chunked request body (we only parse Content-Length),
+    // and guessing would risk request smuggling — refuse rather than corrupt.
+    if head_str.to_ascii_lowercase().contains("transfer-encoding:") {
+        anyhow::bail!("chunked request bodies aren't supported in intercept mode yet");
+    }
+
     // 4. Forward it upstream, forcing a single request/response.
     let content_length = parse_content_length(&head_str);
     let rebuilt = force_connection_close(&head_str);
@@ -157,6 +182,11 @@ fn forward_plain(mut client: TcpStream, head_str: &str, method: &str, target: &s
     let v = fp.next().unwrap_or("HTTP/1.1");
     let mut rebuilt = format!("{m} {path} {v}\r\n");
     for line in lines {
+        // Hop-by-hop proxy headers must not be forwarded to the origin.
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("proxy-connection:") || lower.starts_with("proxy-authorization:") {
+            continue;
+        }
         rebuilt.push_str(line);
         rebuilt.push_str("\r\n");
     }
@@ -191,6 +221,20 @@ fn ca_paths() -> Result<(PathBuf, PathBuf)> {
 
 fn load_ca() -> Result<Ca> {
     let (cert_path, key_path) = ca_paths()?;
+    // Refuse to use a CA key that others can read — it can mint trusted certs.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&key_path)
+            && meta.permissions().mode() & 0o077 != 0
+        {
+            anyhow::bail!(
+                "CA key {} is readable by group/other. Run `casual ca` to fix its \
+                 permissions (or `chmod 600` it) before intercepting.",
+                key_path.display()
+            );
+        }
+    }
     let cert_pem = std::fs::read_to_string(&cert_path)
         .with_context(|| format!("reading {}", cert_path.display()))?;
     let key_pem = std::fs::read_to_string(&key_path)
@@ -219,9 +263,13 @@ pub fn ensure_ca_and_print() -> Result<()> {
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         let cert = params.self_signed(&key).context("self-signing CA")?;
         std::fs::write(&cert_path, cert.pem())?;
-        std::fs::write(&key_path, key.serialize_pem())?;
+        write_private_key(&key_path, &key.serialize_pem())?;
         println!("created a new CA:");
     } else {
+        // Existing CA: make sure the private key isn't group/world-readable.
+        if let Some(old) = harden_key_perms(&key_path)? {
+            println!("tightened key permissions to 0600 (was {old:o})");
+        }
         println!("CA already exists:");
     }
     println!("  cert: {}", cert_path.display());
@@ -234,12 +282,57 @@ pub fn ensure_ca_and_print() -> Result<()> {
         cert_path.display()
     );
     println!(
-        "  Linux : copy it into /usr/local/share/ca-certificates/ and run update-ca-certificates"
+        "  Debian/Ubuntu: copy to /usr/local/share/ca-certificates/ (as .crt), then update-ca-certificates"
     );
-    println!("  Firefox uses its own store: Settings > Certificates > Import.");
+    println!("  Fedora/RHEL  : copy to /etc/pki/ca-trust/source/anchors/, then update-ca-trust");
+    println!(
+        "  Arch         : copy to /etc/ca-certificates/trust-source/anchors/, then trust extract-compat"
+    );
+    println!("  Firefox/Chrome use their own store: import it in the browser's cert settings.");
     println!();
     println!("Then: casual proxy --intercept   (and set 127.0.0.1:8080 as your proxy)");
     Ok(())
+}
+
+/// Write a private key readable only by its owner (0600 on Unix).
+fn write_private_key(path: &Path, pem: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        f.write_all(pem.as_bytes())?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, pem).with_context(|| format!("writing {}", path.display()))
+    }
+}
+
+/// If the key is group/other-accessible, tighten it to 0600; returns the old
+/// mode when it changed.
+#[cfg(unix)]
+fn harden_key_perms(path: &Path) -> Result<Option<u32>> {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(None);
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        return Ok(Some(mode));
+    }
+    Ok(None)
+}
+#[cfg(not(unix))]
+fn harden_key_perms(_path: &Path) -> Result<Option<u32>> {
+    Ok(None)
 }
 
 fn build_server_config(host: &str, ca: &Ca) -> Result<Arc<ServerConfig>> {
@@ -333,6 +426,17 @@ fn force_connection_close(head: &str) -> String {
 }
 
 fn split_host_port(authority: &str, default_port: u16) -> (String, u16) {
+    // Bracketed IPv6: "[::1]" or "[::1]:8080" — strip the brackets so the host
+    // is a valid address for TcpStream/ServerName.
+    if let Some(rest) = authority.strip_prefix('[')
+        && let Some((h, tail)) = rest.split_once(']')
+    {
+        let port = tail
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(default_port);
+        return (h.to_string(), port);
+    }
     match authority.rsplit_once(':') {
         Some((h, p)) => (h.to_string(), p.parse().unwrap_or(default_port)),
         None => (authority.to_string(), default_port),

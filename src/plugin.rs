@@ -4,8 +4,8 @@
 //! in `registry()`. To add one: write a struct, impl `Plugin`, add it to the
 //! Vec. The core never has to change.
 //!
-//! Two example plugins ship: `hash` and `entropy` reuse the scanner's ideas on
-//! a single file; `ports` is a local TCP connect-check (for your own hosts).
+//! Three built-in plugins ship: `hash` and `entropy` reuse the scanner's ideas
+//! on a single file; `ports` is a local TCP connect-check (for your own hosts).
 //!
 //! Want *dynamically loaded* plugins (drop a compiled file in a folder, no
 //! recompile)? Two common routes, noted at the bottom of this file.
@@ -143,6 +143,12 @@ fn plugin_dir() -> Option<PathBuf> {
             return Some(p);
         }
     }
+    if let Some(dir) = crate::config::load().plugin_dir {
+        let p = PathBuf::from(dir);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
     if let Ok(home) = std::env::var("HOME") {
         let p = Path::new(&home).join(".config/casual/plugins");
         if p.is_dir() {
@@ -227,6 +233,15 @@ mod wasm {
     use anyhow::{Context, Result, anyhow};
     use wasmtime::{Caller, Engine, Extern, Linker, Module, Store};
 
+    /// Validate a guest (ptr, len) against the guest memory length, rejecting
+    /// negative or overflowing values. Returns the byte range to read.
+    fn bounds(ptr: i32, len: i32, data_len: usize) -> Option<(usize, usize)> {
+        let start = usize::try_from(ptr).ok()?;
+        let len = usize::try_from(len).ok()?;
+        let end = start.checked_add(len)?;
+        (end <= data_len).then_some((start, end))
+    }
+
     pub fn load() -> Vec<Box<dyn Plugin>> {
         let mut out: Vec<Box<dyn Plugin>> = Vec::new();
         let Some(dir) = plugin_dir() else {
@@ -235,7 +250,16 @@ mod wasm {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return out;
         };
-        let engine = Engine::default();
+        // Fuel metering so a runaway plugin (`loop {}`) can't hang the host.
+        let mut cfg = wasmtime::Config::new();
+        cfg.consume_fuel(true);
+        let engine = match Engine::new(&cfg) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("wasm engine init failed: {e}");
+                return out;
+            }
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("wasm") {
@@ -288,8 +312,9 @@ mod wasm {
                             return;
                         };
                         let data = mem.data(&caller);
-                        let (start, end) = (ptr as usize, ptr as usize + len as usize);
-                        if end <= data.len() {
+                        // Guard against a hostile guest passing negative/overflowing
+                        // ptr/len — otherwise data[start..end] can panic the host.
+                        if let Some((start, end)) = bounds(ptr, len, data.len()) {
                             print!("{}", String::from_utf8_lossy(&data[start..end]));
                         }
                     },
@@ -297,6 +322,8 @@ mod wasm {
                 .context("linking host function")?;
 
             let mut store = Store::new(&self.engine, ());
+            // Bound total execution; a normal plugin uses a tiny fraction.
+            store.set_fuel(1_000_000_000).context("setting wasm fuel")?;
             let instance = linker
                 .instantiate(&mut store, &self.module)
                 .context("instantiating wasm module")?;
@@ -309,6 +336,21 @@ mod wasm {
             } else {
                 anyhow::bail!("wasm plugin '{}' returned {code}", self.name)
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::bounds;
+
+        #[test]
+        fn print_bounds_reject_hostile_ptr_len() {
+            assert_eq!(bounds(0, 5, 10), Some((0, 5)));
+            assert_eq!(bounds(10, 0, 10), Some((10, 10)));
+            assert_eq!(bounds(-1, 1, 10), None); // negative ptr
+            assert_eq!(bounds(5, -1, 10), None); // negative len
+            assert_eq!(bounds(8, 5, 10), None); // out of range
+            assert_eq!(bounds(i32::MAX, i32::MAX, 10), None); // overflow / oob
         }
     }
 }

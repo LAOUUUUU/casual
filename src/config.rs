@@ -6,7 +6,10 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
 
+// Reject unknown keys so a typo like `prox_port = 9000` fails loudly instead
+// of being silently ignored in a hand-edited file.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub proxy_port: Option<u16>,
     pub max_conns: Option<usize>,
@@ -23,7 +26,9 @@ impl Config {
         self.max_conns.unwrap_or(256)
     }
     pub fn entropy_threshold(&self) -> f64 {
-        self.entropy_threshold.unwrap_or(7.2)
+        // Entropy is 0..8 bits/byte; clamp so a bad config value can't make
+        // everything (or nothing) suspicious.
+        self.entropy_threshold.unwrap_or(7.2).clamp(0.0, 8.0)
     }
     pub fn dns_server(&self) -> String {
         self.dns_server
@@ -33,7 +38,7 @@ impl Config {
 }
 
 pub fn path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
     Some(PathBuf::from(home).join(".config/casual/config.toml"))
 }
 
