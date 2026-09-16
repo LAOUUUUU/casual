@@ -39,7 +39,7 @@ wasmtime = { version = "27", optional = true, default-features = false, features
 [features]
 default = []
 intercept = ["dep:rcgen", "dep:rustls", "dep:rustls-pemfile", "dep:webpki-roots"]
-net = ["dep:rustls", "dep:webpki-roots", "dep:x509-parser"]
+net = ["dep:rustls", "dep:rustls-pemfile", "dep:webpki-roots", "dep:x509-parser"]
 tui = ["dep:ratatui", "dep:crossterm"]
 wasm = ["dep:wasmtime"]
 

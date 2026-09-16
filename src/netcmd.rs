@@ -1,29 +1,52 @@
 //! Network diagnostics (the `net` feature): `tls`, `probe`, `replay`.
 //!
-//!   tls    <host[:port]>   handshake and print the server's certificate chain
+//!   tls    <host[:port]>   handshake, audit TLS versions, print the cert chain
 //!   probe  <url>           send one HTTP(S) request; show status/headers/timing
 //!   replay <log.jsonl>     re-issue requests captured by `casual proxy`
 //!
-//! Uses the same rustls client stack as the intercept feature. All of this is
-//! for hosts you own or are authorized to test.
+//! Shared TLS-client options (all `net` commands):
+//!   --insecure        skip certificate validation (like `curl -k`), for your
+//!                     own dev/staging servers with self-signed/expired certs
+//!   --cacert <pem>    trust an ADDITIONAL root CA (e.g. your internal CA),
+//!                     without turning validation off entirely
+//!
+//! All of this is for hosts you own or are authorized to test.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{
+    ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme,
+    StreamOwned,
+};
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Shared TLS-client options.
+#[derive(Args, Clone)]
+pub struct TlsOpts {
+    /// Skip certificate validation (DANGER — for your own hosts only).
+    #[arg(long, global = true)]
+    pub insecure: bool,
+
+    /// Trust an additional root CA certificate (PEM) on top of the built-ins.
+    #[arg(long, global = true)]
+    pub cacert: Option<PathBuf>,
+}
 
 #[derive(Args)]
 pub struct TlsArgs {
     /// host or host:port (default port 443).
     pub target: String,
-    /// Print the chain as JSON.
+    /// Print the audit + chain as JSON.
     #[arg(long)]
     pub json: bool,
+    #[command(flatten)]
+    pub tls: TlsOpts,
 }
 
 #[derive(Args)]
@@ -36,6 +59,19 @@ pub struct ProbeArgs {
     /// Print status/headers/timing as JSON.
     #[arg(long)]
     pub json: bool,
+    #[command(flatten)]
+    pub tls: TlsOpts,
+}
+
+#[derive(Args)]
+pub struct ReplayArgs {
+    /// A JSONL log written by `casual proxy --log-file`.
+    pub file: PathBuf,
+    /// Only replay the first N requests.
+    #[arg(short, long)]
+    pub limit: Option<usize>,
+    #[command(flatten)]
+    pub tls: TlsOpts,
 }
 
 #[derive(serde::Serialize)]
@@ -49,6 +85,18 @@ struct CertInfo {
 }
 
 #[derive(serde::Serialize)]
+struct TlsAudit {
+    host: String,
+    port: u16,
+    negotiated: Option<String>,
+    tls12: bool,
+    tls13: bool,
+    validated: bool,
+    warnings: Vec<String>,
+    chain: Vec<CertInfo>,
+}
+
+#[derive(serde::Serialize)]
 struct ProbeResult {
     status: String,
     headers: Vec<[String; 2]>,
@@ -56,60 +104,150 @@ struct ProbeResult {
     total_ms: u128,
 }
 
-#[derive(Args)]
-pub struct ReplayArgs {
-    /// A JSONL log written by `casual proxy --log-file`.
-    pub file: PathBuf,
-    /// Only replay the first N requests.
-    #[arg(short, long)]
-    pub limit: Option<usize>,
-}
-
-// --- tls --------------------------------------------------------------------
+// --- tls (audit) ------------------------------------------------------------
 
 pub fn tls(args: TlsArgs) -> Result<()> {
     install_provider();
     let (host, port) = split_target(&args.target, 443);
-    let cfg = build_client_config();
-    let name = ServerName::try_from(host.clone()).context("invalid host")?;
-    let mut conn = ClientConnection::new(cfg, name)?;
-    let mut sock = TcpStream::connect((host.as_str(), port))
-        .with_context(|| format!("connecting {host}:{port}"))?;
-    sock.set_read_timeout(Some(Duration::from_secs(10)))?;
 
-    // Drive the handshake to completion so peer certs are available.
-    while conn.is_handshaking() {
-        if conn.complete_io(&mut sock).is_err() {
-            break;
+    // Fetch the chain with the user's options; if validation fails and they
+    // didn't ask for --insecure, retry insecurely just to display the chain.
+    let (chain, negotiated, validated) = match do_handshake(&host, port, &args.tls) {
+        Ok((c, v)) => (c, v, true),
+        Err(_) if !args.tls.insecure => {
+            let insecure = TlsOpts {
+                insecure: true,
+                cacert: None,
+            };
+            let (c, v) = do_handshake(&host, port, &insecure)
+                .context("TLS handshake failed even without verification")?;
+            (c, v, false)
+        }
+        Err(e) => return Err(e),
+    };
+
+    // Version support (probed insecurely so cert validity doesn't skew it).
+    let tls12 = version_supported(&host, port, &rustls::version::TLS12);
+    let tls13 = version_supported(&host, port, &rustls::version::TLS13);
+
+    let mut warnings = Vec::new();
+    if !validated {
+        warnings.push("certificate did NOT validate against trusted roots (shown anyway; pass --cacert or --insecure)".into());
+    }
+    if let Some(leaf) = chain.first() {
+        match leaf.days_left {
+            Some(d) if d < 0 => warnings.push("leaf certificate is EXPIRED".into()),
+            Some(d) if d < 14 => warnings.push(format!("leaf certificate expires in {d} days")),
+            None => warnings.push("leaf certificate validity is unparseable".into()),
+            _ => {}
+        }
+        if chain.len() == 1 && !leaf.subject.is_empty() && leaf.subject == leaf.issuer {
+            warnings.push("leaf certificate is self-signed".into());
         }
     }
-    let certs = conn
-        .peer_certificates()
-        .filter(|c| !c.is_empty())
-        .context("server presented no certificates")?;
+    if !tls13 {
+        warnings.push("server does not support TLS 1.3".into());
+    }
+    if !tls12 && !tls13 {
+        warnings.push("server negotiated neither TLS 1.2 nor 1.3".into());
+    }
 
-    let infos: Vec<CertInfo> = certs.iter().map(|der| parse_cert(der.as_ref())).collect();
+    let audit = TlsAudit {
+        host: host.clone(),
+        port,
+        negotiated,
+        tls12,
+        tls13,
+        validated,
+        warnings,
+        chain,
+    };
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&infos)?);
+        println!("{}", serde_json::to_string_pretty(&audit)?);
         return Ok(());
     }
 
-    println!("{host}:{port} — {} certificate(s) in chain\n", infos.len());
-    for (i, info) in infos.iter().enumerate() {
+    println!("{host}:{port}");
+    println!(
+        "negotiated {}   validated: {}",
+        audit.negotiated.as_deref().unwrap_or("?"),
+        if audit.validated { "yes" } else { "NO" }
+    );
+    println!(
+        "TLS 1.2: {}   TLS 1.3: {}   (1.0/1.1 not probed — rustls speaks 1.2/1.3)",
+        yesno(audit.tls12),
+        yesno(audit.tls13)
+    );
+    if !audit.warnings.is_empty() {
+        println!("\nwarnings:");
+        for w in &audit.warnings {
+            println!("  ! {w}");
+        }
+    }
+    println!("\ncertificates ({}):", audit.chain.len());
+    for (i, info) in audit.chain.iter().enumerate() {
         println!("[{i}] subject: {}", info.subject);
         println!("    issuer:  {}", info.issuer);
         println!("    valid:   {} -> {}", info.not_before, info.not_after);
         match info.days_left {
             Some(d) => println!("    expires in {d} days"),
-            None => println!("    EXPIRED or not yet valid / unparseable"),
+            None => println!("    validity unparseable"),
         }
         if !info.sans.is_empty() {
             println!("    SANs:    {}", info.sans.join(", "));
         }
-        println!();
     }
     Ok(())
+}
+
+/// Handshake and return (parsed chain, negotiated version string).
+fn do_handshake(host: &str, port: u16, opts: &TlsOpts) -> Result<(Vec<CertInfo>, Option<String>)> {
+    let cfg = build_client_config(opts, None)?;
+    let name = ServerName::try_from(host.to_owned()).context("invalid host")?;
+    let mut conn = ClientConnection::new(cfg, name)?;
+    let mut sock =
+        TcpStream::connect((host, port)).with_context(|| format!("connecting {host}:{port}"))?;
+    sock.set_read_timeout(Some(Duration::from_secs(10)))?;
+    while conn.is_handshaking() {
+        conn.complete_io(&mut sock)
+            .map_err(|e| anyhow!("TLS handshake failed: {e}"))?;
+    }
+    let certs = conn
+        .peer_certificates()
+        .filter(|c| !c.is_empty())
+        .context("server presented no certificates")?;
+    let chain = certs.iter().map(|d| parse_cert(d.as_ref())).collect();
+    let negotiated = conn.protocol_version().map(|v| format!("{v:?}"));
+    Ok((chain, negotiated))
+}
+
+/// Does the server complete a handshake pinned to exactly this TLS version?
+/// Probed with verification off, since we only care about version negotiation.
+fn version_supported(host: &str, port: u16, v: &'static rustls::SupportedProtocolVersion) -> bool {
+    let opts = TlsOpts {
+        insecure: true,
+        cacert: None,
+    };
+    let Ok(cfg) = build_client_config(&opts, Some(&[v])) else {
+        return false;
+    };
+    let Ok(name) = ServerName::try_from(host.to_owned()) else {
+        return false;
+    };
+    let Ok(mut conn) = ClientConnection::new(cfg, name) else {
+        return false;
+    };
+    let Ok(mut sock) = TcpStream::connect((host, port)) else {
+        return false;
+    };
+    let _ = sock.set_read_timeout(Some(Duration::from_secs(8)));
+    while conn.is_handshaking() {
+        if conn.complete_io(&mut sock).is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 fn parse_cert(der: &[u8]) -> CertInfo {
@@ -160,7 +298,7 @@ pub fn probe(args: ProbeArgs) -> Result<()> {
     let connect_ms = started.elapsed().as_millis();
 
     let head = if scheme == "https" {
-        let cfg = build_client_config();
+        let cfg = build_client_config(&args.tls, None)?;
         let name = ServerName::try_from(host.clone()).context("invalid host")?;
         let conn = ClientConnection::new(cfg, name)?;
         let mut tls = StreamOwned::new(conn, tcp);
@@ -255,7 +393,7 @@ pub fn replay(args: ReplayArgs) -> Result<()> {
             ),
         };
 
-        match probe_status(&scheme, &host, port, &method, &path) {
+        match probe_status(&scheme, &host, port, &method, &path, &args.tls) {
             Ok(status) => println!("{method} {scheme}://{host}{path} -> {status}"),
             Err(e) => println!("{method} {scheme}://{host}{path} -> error: {e}"),
         }
@@ -264,12 +402,19 @@ pub fn replay(args: ReplayArgs) -> Result<()> {
     Ok(())
 }
 
-fn probe_status(scheme: &str, host: &str, port: u16, method: &str, path: &str) -> Result<String> {
+fn probe_status(
+    scheme: &str,
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    opts: &TlsOpts,
+) -> Result<String> {
     let tcp =
         TcpStream::connect((host, port)).with_context(|| format!("connecting {host}:{port}"))?;
     tcp.set_read_timeout(Some(Duration::from_secs(15)))?;
     let head = if scheme == "https" {
-        let cfg = build_client_config();
+        let cfg = build_client_config(opts, None)?;
         let name = ServerName::try_from(host.to_owned()).context("invalid host")?;
         let conn = ClientConnection::new(cfg, name)?;
         let mut tls = StreamOwned::new(conn, tcp);
@@ -287,14 +432,93 @@ fn install_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
-fn build_client_config() -> Arc<ClientConfig> {
-    let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    Arc::new(
-        ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    )
+fn build_client_config(
+    opts: &TlsOpts,
+    versions: Option<&[&'static rustls::SupportedProtocolVersion]>,
+) -> Result<Arc<ClientConfig>> {
+    let builder = match versions {
+        Some(v) => ClientConfig::builder_with_protocol_versions(v),
+        None => ClientConfig::builder(),
+    };
+    let cfg = if opts.insecure {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth()
+    } else {
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        if let Some(path) = &opts.cacert {
+            add_cacert(&mut roots, path)?;
+        }
+        builder.with_root_certificates(roots).with_no_client_auth()
+    };
+    Ok(Arc::new(cfg))
+}
+
+fn add_cacert(roots: &mut RootCertStore, path: &Path) -> Result<()> {
+    let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut reader = std::io::BufReader::new(&data[..]);
+    let mut added = 0;
+    for cert in rustls_pemfile::certs(&mut reader) {
+        let cert = cert.context("parsing --cacert PEM")?;
+        if roots.add(cert).is_ok() {
+            added += 1;
+        }
+    }
+    if added == 0 {
+        bail!("no certificates found in {}", path.display());
+    }
+    Ok(())
+}
+
+/// A certificate verifier that accepts everything — only used behind
+/// `--insecure`, for inspecting your own hosts.
+#[derive(Debug)]
+struct NoVerify;
+
+impl ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        use rustls::SignatureScheme::*;
+        vec![
+            RSA_PKCS1_SHA256,
+            RSA_PKCS1_SHA384,
+            RSA_PKCS1_SHA512,
+            ECDSA_NISTP256_SHA256,
+            ECDSA_NISTP384_SHA384,
+            ECDSA_NISTP521_SHA512,
+            RSA_PSS_SHA256,
+            RSA_PSS_SHA384,
+            RSA_PSS_SHA512,
+            ED25519,
+        ]
+    }
 }
 
 /// Send one request (forcing Connection: close) and return the response head.
@@ -323,6 +547,10 @@ fn exchange<S: Read + Write>(
         }
     }
     Ok(String::from_utf8_lossy(&head).into_owned())
+}
+
+fn yesno(b: bool) -> &'static str {
+    if b { "yes" } else { "no" }
 }
 
 fn split_target(t: &str, default_port: u16) -> (String, u16) {

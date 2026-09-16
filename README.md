@@ -134,10 +134,22 @@ prints the effective settings. CLI flags always override the file.
 ### net — tls / probe / replay
 ```bash
 cargo build --release --features net
-casual tls example.com          # subject/issuer/validity/days-left/SANs
+casual tls example.com          # audit: negotiated version, TLS 1.2/1.3 support,
+                                #        cert chain, expiry + self-signed warnings
 casual probe https://example.com/
 casual replay traffic.jsonl     # re-issue what the proxy captured
 ```
+
+**Shared TLS options** (on `tls`, `probe`, `replay`) — for your own hosts:
+```bash
+casual probe https://selfsigned.local/ --insecure   # skip cert validation (curl -k)
+casual tls internal.corp --cacert my-root-ca.pem     # trust an extra root CA
+```
+
+`casual tls` doubles as a mini SSL audit: it flags expired/soon-to-expire and
+self-signed certs, whether the server still requires TLS 1.2, and whether it
+offers TLS 1.3. (rustls speaks only TLS 1.2/1.3, so 1.0/1.1 aren't probed.)
+Decrypting your own HTTPS traffic in full is the `intercept` feature below.
 
 ### tui — the live dashboard
 ```bash
