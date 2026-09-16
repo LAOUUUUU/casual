@@ -53,17 +53,31 @@ decryption), `wasm` (sandboxed plugins). Combine freely, e.g.
 ## Commands
 
 ### scan — a mini antivirus
-Streams each file for a SHA-256, computes Shannon entropy (packed/encrypted
-data sits near 8.0 bits/byte), matches a JSON signature DB, **looks inside .zip
-archives**, runs in parallel with a progress bar, and colours verdicts
-(respecting `NO_COLOR`).
+Streams each file for a SHA-256, matches a JSON signature DB, looks inside .zip
+archives, runs in parallel with a progress bar, and colours verdicts.
+With no path it scans your **home directory**; scanning the filesystem root `/`
+needs an explicit `--allow-root`.
+
+```bash
+casual scan                       # scans your home directory
+casual scan ~/Downloads
+casual scan / --allow-root        # whole filesystem (slow; hits system files)
+casual scan ~/Downloads --quarantine ~/.casual-quarantine
+casual scan big.iso --no-archives # skip zip inspection
+```
+
+**MALICIOUS vs SUSPECT — this matters.** `MALICIOUS` means a real signature hit
+(known hash or byte pattern, like the bundled EICAR test string); those are the
+only files `--quarantine` ever moves. `SUSPECT` is *only* the entropy heuristic
+— "this file's bytes look random" — which is normal for compressed, media, and
+encrypted files, so it is **not** a virus verdict and is never quarantined.
+Extensions that are expected to be high-entropy (`.jpg`, `.zip`, `.mp4`,
+`.dmg`, …) aren't flagged at all, to cut the noise. Try the harmless standard
+test file:
 
 ```bash
 printf 'X5O!P%%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' > /tmp/eicar.txt
 casual scan /tmp/eicar.txt
-casual scan ~/Downloads --json > report.jsonl
-casual scan ~/Downloads --quarantine ~/.casual-quarantine   # move MALICIOUS files
-casual scan big.iso --no-archives                            # skip zip inspection
 ```
 
 ### proxy — a local logging proxy

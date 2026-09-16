@@ -21,9 +21,15 @@ pub fn run() -> Result<()> {
 
         match choice.trim() {
             "1" => {
-                let path = prompt("path to scan: ")?;
+                let path = prompt("path to scan [home]: ")?;
+                let p = path.trim();
                 let args = scan::ScanArgs {
-                    path: PathBuf::from(path.trim()),
+                    path: if p.is_empty() {
+                        None
+                    } else {
+                        Some(PathBuf::from(p))
+                    },
+                    allow_root: false,
                     signatures: None,
                     entropy_threshold: None,
                     json: false,

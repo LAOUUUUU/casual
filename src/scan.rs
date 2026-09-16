@@ -28,8 +28,12 @@ const MAX_PATTERN_BYTES: usize = 5 * 1024 * 1024;
 
 #[derive(Args)]
 pub struct ScanArgs {
-    /// File or directory to scan.
-    pub path: PathBuf,
+    /// File or directory to scan (default: your home directory).
+    pub path: Option<PathBuf>,
+
+    /// Permit scanning the filesystem root `/` (slow; touches system files).
+    #[arg(long)]
+    pub allow_root: bool,
 
     /// Path to a signature DB (defaults to ./signatures.json if present).
     #[arg(short, long)]
@@ -96,8 +100,31 @@ pub fn run(args: ScanArgs) -> Result<()> {
         .entropy_threshold
         .unwrap_or_else(|| crate::config::load().entropy_threshold());
 
+    // Default to the home directory when no path is given.
+    let path = match &args.path {
+        Some(p) => p.clone(),
+        None => {
+            let home = home_dir()?;
+            eprintln!(
+                "no path given — scanning your home directory: {}",
+                home.display()
+            );
+            home
+        }
+    };
+
+    // Guard the filesystem root: scanning `/` is slow and hits system and
+    // permission-protected files, so require an explicit opt-in.
+    let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    if canonical == Path::new("/") && !args.allow_root {
+        anyhow::bail!(
+            "refusing to scan the filesystem root '/': it's slow and touches system files.\n\
+             re-run with --allow-root to override, or give a specific path (e.g. a folder)."
+        );
+    }
+
     // Enumerate first so we can show progress and scan files in parallel.
-    let files: Vec<PathBuf> = WalkDir::new(&args.path)
+    let files: Vec<PathBuf> = WalkDir::new(&path)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
@@ -178,6 +205,65 @@ fn quarantine(findings: &[Finding], dir: &Path) {
     );
 }
 
+/// Extensions whose contents are *expected* to be high-entropy (already
+/// compressed, encoded, or encrypted), so entropy alone tells you nothing.
+fn expected_high_entropy(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "zip"
+            | "gz"
+            | "tgz"
+            | "bz2"
+            | "xz"
+            | "zst"
+            | "7z"
+            | "rar"
+            | "lz4"
+            | "br"
+            | "jpg"
+            | "jpeg"
+            | "png"
+            | "gif"
+            | "webp"
+            | "heic"
+            | "avif"
+            | "tiff"
+            | "ico"
+            | "mp4"
+            | "mov"
+            | "mkv"
+            | "avi"
+            | "webm"
+            | "m4v"
+            | "mp3"
+            | "aac"
+            | "flac"
+            | "ogg"
+            | "m4a"
+            | "wav"
+            | "pdf"
+            | "dmg"
+            | "iso"
+            | "pkg"
+            | "apk"
+            | "jar"
+            | "wasm"
+            | "woff"
+            | "woff2"
+            | "ttf"
+            | "otf"
+    )
+}
+
+fn home_dir() -> Result<PathBuf> {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set; pass a path to scan explicitly")
+}
+
 fn move_into(path: &str, dir: &Path) -> Result<String> {
     let src = Path::new(path);
     let base = src
@@ -256,10 +342,14 @@ fn scan_file(
         }
     }
 
-    if size > 1024 && entropy >= entropy_threshold {
+    // Entropy is only a hint, and it's *expected* to be high for already
+    // compressed/encoded/encrypted files (media, archives, …) — flagging those
+    // is pure noise, so skip them. Even when flagged, this is never treated as
+    // malicious and never quarantined.
+    if size > 1024 && entropy >= entropy_threshold && !expected_high_entropy(path) {
         verdict = worse(verdict, Verdict::Suspicious);
         reasons.push(format!(
-            "high entropy {entropy:.2} bits/byte (possibly packed/encrypted)"
+            "high entropy {entropy:.2} bits/byte — looks compressed/encrypted (not necessarily malicious)"
         ));
     }
 
@@ -322,9 +412,12 @@ fn scan_archive(bytes: &[u8], db: &SignatureDb, entropy_threshold: f64) -> (Verd
             freq[b as usize] += 1;
         }
         let ent = shannon_entropy(&freq, buf.len() as u64);
-        if buf.len() > 1024 && ent >= entropy_threshold {
+        if buf.len() > 1024 && ent >= entropy_threshold && !expected_high_entropy(Path::new(&name))
+        {
             verdict = worse(verdict, Verdict::Suspicious);
-            notes.push(format!("archive entry '{name}': high entropy {ent:.2}"));
+            notes.push(format!(
+                "archive entry '{name}': high entropy {ent:.2} (compressed/encrypted, not necessarily malicious)"
+            ));
         }
     }
     (verdict, notes)
@@ -410,6 +503,12 @@ fn report(findings: &[Finding], show_all: bool) {
         sus,
         if shown == 0 { " (all clean)" } else { "" }
     );
+    if sus > 0 {
+        println!(
+            "note: 'suspicious' is only the high-entropy heuristic (compressed/encrypted-looking) — \
+             not a virus verdict. Only signature-matched 'malicious' files are ever quarantined."
+        );
+    }
 }
 
 fn tag_for(verdict: Verdict, color: bool) -> String {
